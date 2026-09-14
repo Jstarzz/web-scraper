@@ -13,6 +13,7 @@ type Config struct {
 	AdminToken            string
 	RetentionDays         int
 	WorkerID              string
+	WorkerConcurrency     int
 	WorkerPollInterval    time.Duration
 	BrowserWorkerURL      string
 	BrowserRequestTimeout time.Duration
@@ -25,6 +26,7 @@ func Load() (Config, error) {
 		AdminToken:            os.Getenv("ADMIN_TOKEN"),
 		RetentionDays:         envInt("RETENTION_DAYS", 60),
 		WorkerID:              env("WORKER_ID", hostname()),
+		WorkerConcurrency:     envInt("WORKER_CONCURRENCY", 4),
 		WorkerPollInterval:    envDuration("WORKER_POLL_INTERVAL", 500*time.Millisecond),
 		BrowserWorkerURL:      env("BROWSER_WORKER_URL", "http://browser-worker:3000"),
 		BrowserRequestTimeout: envDuration("BROWSER_REQUEST_TIMEOUT", 45*time.Second),
@@ -34,6 +36,9 @@ func Load() (Config, error) {
 	}
 	if cfg.RetentionDays < 1 {
 		return Config{}, fmt.Errorf("RETENTION_DAYS must be >= 1")
+	}
+	if cfg.WorkerConcurrency < 1 || cfg.WorkerConcurrency > 64 {
+		return Config{}, fmt.Errorf("WORKER_CONCURRENCY must be between 1 and 64")
 	}
 	return cfg, nil
 }
