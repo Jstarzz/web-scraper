@@ -38,3 +38,13 @@ jobs:
       - run: npm install --package-lock-only --ignore-scripts
       - run: npm ci --ignore-scripts
       - run: npm test
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose config --quiet
+      - run: docker build --target api -t web-scraper-api:ci .
+      - run: docker build --target worker -t web-scraper-worker:ci .
+      - run: docker build -t web-scraper-browser:ci ./browser-worker
