@@ -7,8 +7,8 @@ test("parses Amazon search result cards", () => {
   <div data-component-type="s-search-result" data-asin="B0TEST123">
     <h2><a href="/dp/B0TEST123?ref=abc"><span>Example GPU 16GB</span></a></h2>
     <span class="a-price"><span class="a-offscreen">$499.99</span></span>
-    <span class="a-icon-alt">4.7 out of 5 stars</span>
-    <a href="/product-reviews/B0TEST123#customerReviews"><span>1.2K</span></a>
+    <span aria-label="4.7 out of 5 stars"></span>
+    <span aria-label="1.2K ratings"></span>
     <img class="s-image" src="https://images.example/gpu.jpg" />
   </div>`;
   const [item] = parseAmazon(html, 10);
@@ -20,7 +20,43 @@ test("parses Amazon search result cards", () => {
   assert.equal(item.review_count, 1_200);
 });
 
-test("parses and deduplicates AliExpress cards", () => {
+test("uses Amazon data-asin fallback when component marker changes", () => {
+  const html = `<div data-asin="B0FALLBACK"><a href="/dp/B0FALLBACK"><span class="a-text-normal">Fallback Item</span></a><span class="a-price"><span class="a-offscreen">$10.00</span></span></div>`;
+  const [item] = parseAmazon(html, 10);
+  assert.equal(item.external_id, "B0FALLBACK");
+  assert.equal(item.price_minor, 1_000);
+});
+
+test("prefers AliExpress runParams search data", () => {
+  const runParams = {
+    mods: {
+      itemList: {
+        content: [{
+          productId: "1005009999999999",
+          title: { displayTitle: "ESP32 Touch Display" },
+          prices: { salePrice: { formattedPrice: "US $19.95", currencyCode: "USD" } },
+          trade: { tradeDesc: "2K+ sold" },
+          store: { storeName: "Embedded Store" },
+          evaluation: { starRating: "4.8", evaluationCount: "730" },
+          image: { imgUrl: "//ae.example/display.jpg" },
+          productDetailUrl: "//www.aliexpress.com/item/1005009999999999.html?spm=abc"
+        }]
+      }
+    }
+  };
+  const html = `<script>window.runParams = ${JSON.stringify(runParams)};</script>`;
+  const [item] = parseAliExpress(html, 10);
+  assert.equal(item.external_id, "1005009999999999");
+  assert.equal(item.title, "ESP32 Touch Display");
+  assert.equal(item.price_minor, 1_995);
+  assert.equal(item.currency, "USD");
+  assert.equal(item.seller, "Embedded Store");
+  assert.equal(item.rating, 4.8);
+  assert.equal(item.review_count, 730);
+  assert.equal(item.image_url, "https://ae.example/display.jpg");
+});
+
+test("parses and deduplicates AliExpress DOM cards", () => {
   const html = `
   <div class="search-card-item">
     <a href="https://www.aliexpress.com/item/1005001234567890.html?spm=test" title="USB C Development Board">

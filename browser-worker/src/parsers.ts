@@ -34,7 +34,8 @@ function countFrom(text?: string | null): number | undefined {
   if (!match) return undefined;
   const base = Number(match[1]);
   if (!Number.isFinite(base)) return undefined;
-  const multiplier = match[2]?.toUpperCase() === "K" ? 1_000 : match[2]?.toUpperCase() === "M" ? 1_000_000 : match[2]?.toUpperCase() === "B" ? 1_000_000_000 : 1;
+  const suffix = match[2]?.toUpperCase();
+  const multiplier = suffix === "K" ? 1_000 : suffix === "M" ? 1_000_000 : suffix === "B" ? 1_000_000_000 : 1;
   return Math.round(base * multiplier);
 }
 
@@ -59,6 +60,12 @@ function canonical(base: string, href: string): string {
   }
 }
 
+function imageURL(value: string): string | undefined {
+  const cleaned = compact(value);
+  if (!cleaned) return undefined;
+  return cleaned.startsWith("//") ? `https:${cleaned}` : cleaned;
+}
+
 function dedupe(listings: Listing[], limit: number): Listing[] {
   const seen = new Set<string>();
   const out: Listing[] = [];
@@ -75,31 +82,39 @@ function dedupe(listings: Listing[], limit: number): Listing[] {
 
 export function parseAmazon(html: string, limit: number): Listing[] {
   const $ = cheerio.load(html);
+  let cards = $('[data-component-type="s-search-result"]');
+  if (!cards.length) {
+    cards = $('div[data-asin]').filter((_, raw) => Boolean(compact($(raw).attr("data-asin"))));
+  }
+
   const out: Listing[] = [];
-  $('[data-component-type="s-search-result"]').each((_, raw) => {
+  cards.each((_, raw) => {
     if (out.length >= limit) return false;
     const card = $(raw);
     const asin = compact(card.attr("data-asin"));
     if (!asin) return;
-    const link = card.find("h2 a").first();
+    const link = card.find('h2 a, a[href*="/dp/"]').first();
     const href = link.attr("href") ?? "";
-    const title = compact(link.find("span").first().text()) || compact(card.find("h2").first().text());
+    const title = compact(link.find("span").first().text())
+      || compact(card.find("h2 span").first().text())
+      || compact(card.find(".a-text-normal").first().text());
     if (!href || !title) return;
 
     const priceText = compact(card.find(".a-price .a-offscreen").first().text())
       || compact(card.find(".a-price").first().text());
     const price = money(priceText);
-    const ratingText = compact(card.find(".a-icon-alt").first().text());
-    const reviewText = compact(card.find('a[href*="customerReviews"] span').last().text())
+    const ratingText = compact(card.find('[aria-label*="out of 5 stars"]').first().attr("aria-label"))
+      || compact(card.find(".a-icon-alt").first().text());
+    const reviewText = compact(card.find('[aria-label*="ratings"]').first().attr("aria-label"))
+      || compact(card.find('a[href*="customerReviews"] span').last().text())
       || compact(card.find(".a-size-base.s-underline-text").first().text());
-    const image = card.find("img.s-image").first().attr("src") ?? "";
 
     out.push({
       marketplace: "amazon",
       external_id: asin,
       title,
       url: canonical("https://www.amazon.com", href),
-      image_url: image || undefined,
+      image_url: imageURL(card.find("img.s-image").first().attr("src") ?? ""),
       price_minor: price.minor,
       currency: price.currency,
       available: true,
@@ -110,7 +125,72 @@ export function parseAmazon(html: string, limit: number): Listing[] {
   return dedupe(out, limit);
 }
 
-function aliCard($: cheerio.CheerioAPI, link: cheerio.Cheerio<any>): cheerio.Cheerio<any> {
+function dig(root: unknown, ...path: Array<string | number>): unknown {
+  let value = root;
+  for (const key of path) {
+    if (typeof key === "number") {
+      if (!Array.isArray(value) || key >= value.length) return undefined;
+      value = value[key];
+      continue;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    value = (value as Record<string, unknown>)[key];
+  }
+  return value;
+}
+
+function textValue(value: unknown): string {
+  if (typeof value === "string" || typeof value === "number") return compact(String(value));
+  return "";
+}
+
+function aliRunParams(html: string, limit: number): Listing[] {
+  const match = html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/i);
+  if (!match) return [];
+  let root: unknown;
+  try {
+    root = JSON.parse(match[1]);
+  } catch {
+    return [];
+  }
+  const items = dig(root, "mods", "itemList", "content");
+  if (!Array.isArray(items)) return [];
+
+  const out: Listing[] = [];
+  for (const raw of items) {
+    if (out.length >= limit) break;
+    const id = textValue(dig(raw, "productId"));
+    const title = textValue(dig(raw, "title", "displayTitle")) || textValue(dig(raw, "title", "seoTitle"));
+    if (!id || !title) continue;
+
+    const formattedPrice = textValue(dig(raw, "prices", "salePrice", "formattedPrice"))
+      || textValue(dig(raw, "prices", "originalPrice", "formattedPrice"));
+    const parsedPrice = money(formattedPrice);
+    const currency = textValue(dig(raw, "prices", "salePrice", "currencyCode")) || parsedPrice.currency;
+    const href = textValue(dig(raw, "productDetailUrl")) || `/item/${id}.html`;
+    const seller = textValue(dig(raw, "store", "storeName"));
+    const rating = ratingFrom(textValue(dig(raw, "evaluation", "starRating")) || textValue(dig(raw, "evaluation", "averageStar")));
+    const reviews = countFrom(textValue(dig(raw, "evaluation", "evaluationCount")) || textValue(dig(raw, "evaluation", "totalValidNum")));
+    const image = textValue(dig(raw, "image", "imgUrl")) || textValue(dig(raw, "image", "imageUrl"));
+
+    out.push({
+      marketplace: "aliexpress",
+      external_id: id,
+      title,
+      url: canonical("https://www.aliexpress.com", href),
+      image_url: imageURL(image),
+      seller: seller || undefined,
+      price_minor: parsedPrice.minor,
+      currency: currency || undefined,
+      available: true,
+      rating,
+      review_count: reviews,
+    });
+  }
+  return out;
+}
+
+function aliCard(link: cheerio.Cheerio<any>): cheerio.Cheerio<any> {
   const specific = link.closest('[class*="search-item"], [class*="search-card"], [class*="product-card"], [class*="product-item"], [class*="card-item"]');
   if (specific.length) return specific.first();
   let node = link;
@@ -124,7 +204,7 @@ function aliCard($: cheerio.CheerioAPI, link: cheerio.Cheerio<any>): cheerio.Che
   return link.parent();
 }
 
-export function parseAliExpress(html: string, limit: number): Listing[] {
+function aliDOM(html: string, limit: number): Listing[] {
   const $ = cheerio.load(html);
   const out: Listing[] = [];
   const seen = new Set<string>();
@@ -137,7 +217,7 @@ export function parseAliExpress(html: string, limit: number): Listing[] {
     if (!match || seen.has(match[1])) return;
     seen.add(match[1]);
 
-    const card = aliCard($, link);
+    const card = aliCard(link);
     const image = card.find("img").first();
     const title = compact(link.attr("title"))
       || compact(card.find('[class*="title"]').first().text())
@@ -152,14 +232,14 @@ export function parseAliExpress(html: string, limit: number): Listing[] {
     const shipping = /free\s+shipping/i.test(shippingText) ? { minor: 0, currency: price.currency } : money(shippingText);
     const seller = compact(card.find('[class*="store"], [class*="shop"]').first().text());
     const ratingText = compact(card.find('[class*="rating"], [class*="star"]').first().text());
-    const imageURL = image.attr("src") ?? image.attr("data-src") ?? image.attr("data-lazy-src") ?? "";
+    const rawImage = image.attr("src") ?? image.attr("data-src") ?? image.attr("data-lazy-src") ?? "";
 
     out.push({
       marketplace: "aliexpress",
       external_id: match[1],
       title,
       url: canonical("https://www.aliexpress.com", href),
-      image_url: imageURL || undefined,
+      image_url: imageURL(rawImage),
       seller: seller || undefined,
       price_minor: price.minor,
       shipping_minor: shipping.minor,
@@ -168,8 +248,13 @@ export function parseAliExpress(html: string, limit: number): Listing[] {
       rating: ratingFrom(ratingText),
     });
   });
+  return out;
+}
 
-  return dedupe(out, limit);
+export function parseAliExpress(html: string, limit: number): Listing[] {
+  const structured = aliRunParams(html, limit);
+  const dom = aliDOM(html, limit);
+  return dedupe([...structured, ...dom], limit);
 }
 
 export function parseEbay(html: string, limit: number): Listing[] {
@@ -191,7 +276,7 @@ export function parseEbay(html: string, limit: number): Listing[] {
       external_id: id,
       title,
       url: canonical("https://www.ebay.com", href),
-      image_url: card.find("img").first().attr("src") || undefined,
+      image_url: imageURL(card.find("img").first().attr("src") ?? ""),
       seller: compact(card.find(".s-item__seller-info-text, .s-item__seller-info").first().text()) || undefined,
       price_minor: price.minor,
       shipping_minor: ship.minor,

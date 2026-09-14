@@ -42,12 +42,17 @@ function parse(marketplace: Marketplace, html: string, limit: number): Listing[]
 }
 
 function looksChallenged(html: string): boolean {
-  const sample = html.slice(0, 500_000).toLowerCase();
+  const sample = html.slice(0, 750_000).toLowerCase();
   return sample.includes("captcha")
     || sample.includes("robot check")
     || sample.includes("verify you are human")
     || sample.includes("unusual traffic")
-    || sample.includes("access denied");
+    || sample.includes("access denied")
+    || sample.includes("please slide to verify")
+    || sample.includes("_____tmd_____/punish")
+    || sample.includes("x5secdata")
+    || sample.includes("nc_1_wrapper")
+    || sample.includes("baxia");
 }
 
 async function directHTML(marketplace: Marketplace, query: string): Promise<string> {
@@ -72,7 +77,7 @@ async function directHTML(marketplace: Marketplace, query: string): Promise<stri
 
 async function waitForMarketplace(page: Page, marketplace: Marketplace): Promise<void> {
   const selector = marketplace === "amazon"
-    ? '[data-component-type="s-search-result"]'
+    ? '[data-component-type="s-search-result"], div[data-asin]:not([data-asin=""])'
     : marketplace === "aliexpress"
       ? 'a[href*="/item/"]'
       : "li.s-item";
