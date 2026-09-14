@@ -17,12 +17,19 @@ const marketplaceMinIntervalMs: Record<Marketplace, number> = {
   aliexpress: Math.max(0, Number(process.env.ALIEXPRESS_MIN_INTERVAL_MS ?? 300)),
   ebay: Math.max(0, Number(process.env.EBAY_MIN_INTERVAL_MS ?? 200)),
 };
+const marketplaceConcurrency: Record<Marketplace, number> = {
+  amazon: Math.max(1, Number(process.env.AMAZON_MAX_CONCURRENT ?? 4)),
+  aliexpress: Math.max(1, Number(process.env.ALIEXPRESS_MAX_CONCURRENT ?? 2)),
+  ebay: Math.max(1, Number(process.env.EBAY_MAX_CONCURRENT ?? 3)),
+};
 
 let browser: Browser;
 let active = 0;
 const waiters: Array<() => void> = [];
 const nextRequestAt = new Map<Marketplace, number>();
 const pacingTails = new Map<Marketplace, Promise<void>>();
+const marketplaceActive = new Map<Marketplace, number>();
+const marketplaceWaiters = new Map<Marketplace, Array<() => void>>();
 
 async function acquire(): Promise<void> {
   if (active < concurrency) {
@@ -36,6 +43,27 @@ async function acquire(): Promise<void> {
 function release(): void {
   active--;
   waiters.shift()?.();
+}
+
+async function acquireMarketplace(marketplace: Marketplace): Promise<void> {
+  const current = marketplaceActive.get(marketplace) ?? 0;
+  if (current < marketplaceConcurrency[marketplace]) {
+    marketplaceActive.set(marketplace, current + 1);
+    return;
+  }
+  const queue = marketplaceWaiters.get(marketplace) ?? [];
+  await new Promise<void>((resolve) => queue.push(resolve));
+  marketplaceWaiters.set(marketplace, queue);
+  marketplaceActive.set(marketplace, (marketplaceActive.get(marketplace) ?? 0) + 1);
+}
+
+function releaseMarketplace(marketplace: Marketplace): void {
+  const current = marketplaceActive.get(marketplace) ?? 1;
+  marketplaceActive.set(marketplace, Math.max(0, current - 1));
+  const queue = marketplaceWaiters.get(marketplace);
+  const next = queue?.shift();
+  if (queue && queue.length === 0) marketplaceWaiters.delete(marketplace);
+  next?.();
 }
 
 function delay(ms: number): Promise<void> {
@@ -119,20 +147,25 @@ async function readBoundedHTML(response: Response): Promise<string> {
 
 async function directHTML(marketplace: Marketplace, query: string): Promise<string> {
   await pace(marketplace);
-  const response = await fetch(searchURL(marketplace, query), {
-    redirect: "follow",
-    signal: AbortSignal.timeout(httpTimeout),
-    headers: {
-      "user-agent": userAgent,
-      "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "accept-language": "en-US,en;q=0.9",
-      "cache-control": "no-cache",
-    },
-  });
-  if (!response.ok) throw new Error(`HTTP fast path status ${response.status}`);
-  const html = await readBoundedHTML(response);
-  if (looksChallenged(html)) throw new Error("HTTP fast path received a challenge page");
-  return html;
+  await acquireMarketplace(marketplace);
+  try {
+    const response = await fetch(searchURL(marketplace, query), {
+      redirect: "follow",
+      signal: AbortSignal.timeout(httpTimeout),
+      headers: {
+        "user-agent": userAgent,
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "cache-control": "no-cache",
+      },
+    });
+    if (!response.ok) throw new Error(`HTTP fast path status ${response.status}`);
+    const html = await readBoundedHTML(response);
+    if (looksChallenged(html)) throw new Error("HTTP fast path received a challenge page");
+    return html;
+  } finally {
+    releaseMarketplace(marketplace);
+  }
 }
 
 async function waitForMarketplace(page: Page, marketplace: Marketplace): Promise<void> {
@@ -157,6 +190,7 @@ async function waitForMarketplace(page: Page, marketplace: Marketplace): Promise
 
 async function browserHTML(marketplace: Marketplace, query: string): Promise<string> {
   await pace(marketplace);
+  await acquireMarketplace(marketplace);
   await acquire();
   try {
     const context = await browser.newContext({
@@ -188,6 +222,7 @@ async function browserHTML(marketplace: Marketplace, query: string): Promise<str
     }
   } finally {
     release();
+    releaseMarketplace(marketplace);
   }
 }
 
@@ -258,6 +293,8 @@ const server = http.createServer(async (req, res) => {
         max_html_bytes: maxHTMLBytes,
         request_jitter_ms: requestJitterMs,
         marketplace_min_interval_ms: marketplaceMinIntervalMs,
+        marketplace_max_concurrent: marketplaceConcurrency,
+        marketplace_active: Object.fromEntries(marketplaceActive),
       });
       return;
     }
@@ -280,7 +317,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, "0.0.0.0", () => console.log(JSON.stringify({ level: "info", message: "extraction worker listening", port, concurrency, http_fast_path: httpFastPath, block_images: blockImages })));
+server.listen(port, "0.0.0.0", () => console.log(JSON.stringify({ level: "info", message: "extraction worker listening", port, concurrency, http_fast_path: httpFastPath, block_images: blockImages, marketplace_max_concurrent: marketplaceConcurrency })));
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
     server.close();
