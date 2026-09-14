@@ -8,6 +8,7 @@ const concurrency = Math.max(1, Number(process.env.BROWSER_CONCURRENCY ?? 4));
 const navTimeout = Math.max(5_000, Number(process.env.BROWSER_NAV_TIMEOUT_MS ?? 30_000));
 const httpTimeout = Math.max(2_000, Number(process.env.HTTP_FAST_TIMEOUT_MS ?? 12_000));
 const httpFastPath = !/^(0|false|no)$/i.test(process.env.HTTP_FAST_PATH ?? "true");
+const blockImages = !/^(0|false|no)$/i.test(process.env.BROWSER_BLOCK_IMAGES ?? "true");
 const maxHTMLBytes = Math.max(1 << 20, Number(process.env.MAX_HTML_BYTES ?? 8 << 20));
 const userAgent = process.env.SCRAPER_USER_AGENT || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36";
 
@@ -81,11 +82,16 @@ async function waitForMarketplace(page: Page, marketplace: Marketplace): Promise
     : marketplace === "aliexpress"
       ? 'a[href*="/item/"]'
       : "li.s-item";
+
   await page.locator(selector).first().waitFor({ state: "attached", timeout: Math.min(navTimeout, 8_000) }).catch(() => undefined);
+
   if (marketplace === "aliexpress") {
-    for (let i = 0; i < 2; i++) {
-      await page.evaluate(() => window.scrollBy(0, Math.max(800, window.innerHeight)));
-      await page.waitForTimeout(350);
+    // AliExpress search cards hydrate progressively. This only runs on the browser fallback,
+    // so spending a few seconds here is preferable to returning a thin first paint.
+    await page.waitForTimeout(800);
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => window.scrollBy(0, Math.max(900, window.innerHeight)));
+      await page.waitForTimeout(900);
     }
   }
 }
@@ -97,11 +103,12 @@ async function browserHTML(marketplace: Marketplace, query: string): Promise<str
       locale: "en-US",
       userAgent,
       viewport: { width: 1365, height: 900 },
+      serviceWorkers: "block",
     });
     const page = await context.newPage();
     await page.route("**/*", async (route) => {
       const type = route.request().resourceType();
-      if (type === "font" || type === "media") await route.abort();
+      if (type === "font" || type === "media" || (blockImages && type === "image")) await route.abort();
       else await route.continue();
     });
     try {
@@ -154,9 +161,9 @@ async function scrape(input: ScrapeRequest): Promise<ScrapeResult> {
 }
 
 function json(res: http.ServerResponse, status: number, payload: unknown): void {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
-  res.end(body);
+  const responseBody = JSON.stringify(payload);
+  res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(responseBody) });
+  res.end(responseBody);
 }
 
 async function body(req: http.IncomingMessage): Promise<ScrapeRequest> {
@@ -175,7 +182,7 @@ browser = await chromium.launch({ headless: true });
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/healthz") {
-      json(res, 200, { ok: true, active, concurrency, http_fast_path: httpFastPath, http_timeout_ms: httpTimeout });
+      json(res, 200, { ok: true, active, concurrency, http_fast_path: httpFastPath, block_images: blockImages, http_timeout_ms: httpTimeout });
       return;
     }
     if (req.method !== "POST" || req.url !== "/scrape") {
@@ -197,7 +204,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, "0.0.0.0", () => console.log(JSON.stringify({ level: "info", message: "extraction worker listening", port, concurrency, http_fast_path: httpFastPath })));
+server.listen(port, "0.0.0.0", () => console.log(JSON.stringify({ level: "info", message: "extraction worker listening", port, concurrency, http_fast_path: httpFastPath, block_images: blockImages })));
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
     server.close();
