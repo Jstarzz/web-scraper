@@ -21,6 +21,10 @@ services:
       HTTP_FAST_TIMEOUT_MS: ${HTTP_FAST_TIMEOUT_MS:-12000}
       MAX_HTML_BYTES: ${MAX_HTML_BYTES:-8388608}
       SCRAPER_USER_AGENT: ${SCRAPER_USER_AGENT:-}
+      AMAZON_MIN_INTERVAL_MS: ${AMAZON_MIN_INTERVAL_MS:-350}
+      ALIEXPRESS_MIN_INTERVAL_MS: ${ALIEXPRESS_MIN_INTERVAL_MS:-300}
+      EBAY_MIN_INTERVAL_MS: ${EBAY_MIN_INTERVAL_MS:-200}
+      REQUEST_JITTER_MS: ${REQUEST_JITTER_MS:-100}
     shm_size: "768mb"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
