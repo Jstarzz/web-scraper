@@ -17,10 +17,25 @@ Cloudflare Tunnel
  |                                            |
 Xeon worker(s)                              mini worker
  |                                            |
-Playwright browser worker                  Playwright browser worker
+extraction worker                           extraction worker
+ |                                            |
+HTTP fast path -> Chromium fallback         HTTP fast path -> Chromium fallback
 ```
 
 There is no Redis requirement in v0. PostgreSQL uses `FOR UPDATE SKIP LOCKED` as the distributed work queue, keeping the two-node deployment small and durable. Redis can be introduced later if queue contention actually becomes measurable.
+
+## Amazon and AliExpress focus
+
+Most extraction work is concentrated on Amazon and AliExpress:
+
+- plain HTTP is attempted first for throughput and low RAM usage;
+- Chromium/Playwright is the fallback when the HTTP response is thin or unusable;
+- Amazon uses the current `data-component-type="s-search-result"` structure plus a `data-asin` fallback;
+- AliExpress prefers the structured `window.runParams -> mods.itemList.content` payload when present, then falls back to rendered DOM cards;
+- known challenge/verification pages are detected and treated as failures rather than being stored as product data;
+- structured and DOM results are deduplicated by marketplace product ID.
+
+The service does not implement CAPTCHA solving, fingerprint spoofing, login automation, or challenge bypass.
 
 ## What exists now
 
@@ -29,12 +44,14 @@ There is no Redis requirement in v0. PostgreSQL uses `FOR UPDATE SKIP LOCKED` as
 - Per-client API keys: secrets are generated once, SHA-256 hashes are persisted, and each client gets an independent rate limit.
 - 60-day configurable product observation history.
 - Change-only history writes plus a 24-hour heartbeat to avoid wasting storage.
-- Playwright browser worker with Amazon, AliExpress, and eBay search extractors.
+- HTTP-first + Playwright extraction worker for Amazon and AliExpress; eBay remains supported as a lighter fallback path.
 - Browser concurrency limits instead of launching an unbounded number of Chromium contexts.
 - Stale-job recovery and worker heartbeats.
 - Cloudflare Tunnel Compose profile.
 - Separate worker-only Compose file for a 4-core / 8 GB secondary node.
-- CI for Go tests/vet and strict TypeScript compilation.
+- Proxmox LXC bootstrap installer.
+- Parser regression tests for Amazon and AliExpress.
+- CI for Go tests/vet and TypeScript/parser tests.
 
 ## API
 
@@ -72,15 +89,37 @@ curl 'https://scrape.example.com/v1/history/aliexpress/1005001234567890?days=60'
   -H "Authorization: Bearer $SCRAPER_API_KEY"
 ```
 
-## Deployment
+## Proxmox LXC deployment
 
-Copy `.env.example` to `.env`, set database/admin secrets, and point `SCRAPER_DATA_DIR` at the primary server's data disk.
+The recommended primary deployment is **one dedicated LXC** on the dual-Xeon host. Docker Compose runs inside that LXC; PostgreSQL, API, workers, Chromium and cloudflared remain isolated from the Proxmox host.
 
-Primary:
+Suggested starting allocation:
+
+- 8 vCPU
+- 12 GB RAM (8 GB works with lower browser concurrency)
+- 24-32 GB root filesystem
+- HDD-backed bind/mount for `/srv/web-scraper/postgres`
+- LXC features `nesting=1,keyctl=1`
+
+Copy/clone the repo into the LXC and run:
 
 ```bash
-docker compose --profile tunnel up -d --build
+cd /opt/web-scraper
+chmod +x deploy/lxc/install.sh
+deploy/lxc/install.sh
 ```
+
+The installer generates database/admin secrets, starts the stack, and issues the first `josiah-mcp` API key once. Add `TUNNEL_TOKEN` to `.env` to enable the Cloudflare Tunnel profile.
+
+After saving the returned client key, run the live smoke test:
+
+```bash
+chmod +x deploy/lxc/smoke.sh
+export SCRAPER_API_KEY='ws_live_...'
+deploy/lxc/smoke.sh
+```
+
+That sends one real AliExpress search and one real Amazon search through the full API -> queue -> worker -> extractor path.
 
 Worker-only node:
 
@@ -88,7 +127,7 @@ Worker-only node:
 docker compose -f compose.worker.yml up -d --build
 ```
 
-See [`docs/deployment.md`](docs/deployment.md) for the dual-Xeon + 4-core/8-GB topology and Cloudflare/Tailscale notes.
+See [`docs/deployment.md`](docs/deployment.md) and [`deploy/lxc/README.md`](deploy/lxc/README.md) for the dual-Xeon + 4-core/8-GB topology and Cloudflare/Tailscale notes.
 
 ## Storage
 
