@@ -149,32 +149,124 @@ function textValue(value: unknown): string {
   return "";
 }
 
-function aliRunParams(html: string, limit: number): Listing[] {
-  const match = html.match(/window\.runParams\s*=\s*(\{[\s\S]*?\})\s*;?\s*<\/script>/i);
-  if (!match) return [];
-  let root: unknown;
-  try {
-    root = JSON.parse(match[1]);
-  } catch {
-    return [];
+function numericMinor(value: unknown): number | undefined {
+  if (typeof value !== "number" && typeof value !== "string") return undefined;
+  const parsed = Number(String(value).replace(/,/g, "").trim());
+  return Number.isFinite(parsed) ? Math.round(parsed * 100) : undefined;
+}
+
+function extractJSONObject(html: string, start: number, maxScan = 3_000_000): unknown {
+  if (start < 0 || start >= html.length || html[start] !== "{") return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  const end = Math.min(html.length, start + maxScan);
+
+  for (let i = start; i < end; i++) {
+    const ch = html[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && inString) {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(html.slice(start, i + 1));
+        } catch {
+          return undefined;
+        }
+      }
+    }
   }
-  const items = dig(root, "mods", "itemList", "content");
-  if (!Array.isArray(items)) return [];
+  return undefined;
+}
+
+function aliRunParamsRoot(html: string): unknown {
+  const marker = html.search(/window\.runParams\s*=/i);
+  if (marker < 0) return undefined;
+  const start = html.indexOf("{", marker);
+  return extractJSONObject(html, start, 2_000_000);
+}
+
+function aliInitDataRoot(html: string): unknown {
+  const markerStart = html.indexOf("init-data-start");
+  const markerEnd = html.indexOf("init-data-end", Math.max(0, markerStart));
+  if (markerStart >= 0 && markerEnd > markerStart) {
+    const dataOffset = html.indexOf("data:", markerStart);
+    if (dataOffset >= markerStart && dataOffset < markerEnd) {
+      const jsonStart = html.indexOf("{", dataOffset + 5);
+      if (jsonStart >= 0 && jsonStart < markerEnd) {
+        const parsed = extractJSONObject(html, jsonStart, markerEnd - jsonStart + 100);
+        if (parsed) return parsed;
+      }
+    }
+  }
+
+  const assignment = html.indexOf("_dida_config_._init_data_=");
+  if (assignment < 0) return undefined;
+  const dataOffset = html.indexOf("data:", assignment + 26);
+  if (dataOffset < 0 || dataOffset - assignment > 80) return undefined;
+  const jsonStart = html.indexOf("{", dataOffset + 5);
+  return extractJSONObject(html, jsonStart, 2_000_000);
+}
+
+function findAliItemList(value: unknown, depth = 0): unknown[] | undefined {
+  if (depth > 10 || value === null || typeof value !== "object") return undefined;
+  if (Array.isArray(value)) {
+    for (const child of value) {
+      const found = findAliItemList(child, depth + 1);
+      if (found) return found;
+    }
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  const itemList = record.itemList;
+  if (itemList && typeof itemList === "object" && !Array.isArray(itemList)) {
+    const content = (itemList as Record<string, unknown>).content;
+    if (Array.isArray(content)) return content;
+  }
+  for (const child of Object.values(record)) {
+    const found = findAliItemList(child, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function aliStructuredListings(root: unknown, limit: number): Listing[] {
+  const items = findAliItemList(root);
+  if (!items) return [];
 
   const out: Listing[] = [];
   for (const raw of items) {
     if (out.length >= limit) break;
-    const id = textValue(dig(raw, "productId"));
-    const title = textValue(dig(raw, "title", "displayTitle")) || textValue(dig(raw, "title", "seoTitle"));
+    const id = textValue(dig(raw, "productId")) || textValue(dig(raw, "redirectedId"));
+    const title = textValue(dig(raw, "title", "displayTitle"))
+      || textValue(dig(raw, "title", "seoTitle"))
+      || textValue(dig(raw, "title"));
     if (!id || !title) continue;
 
     const salePriceText = textValue(dig(raw, "prices", "salePrice", "formattedPrice"));
     const originalPriceText = textValue(dig(raw, "prices", "originalPrice", "formattedPrice"));
     const parsedPrice = money(salePriceText || originalPriceText);
     const originalPrice = money(originalPriceText);
+    const saleMinor = parsedPrice.minor ?? numericMinor(dig(raw, "prices", "salePrice", "minPrice"));
+    const originalMinor = originalPrice.minor ?? numericMinor(dig(raw, "prices", "originalPrice", "minPrice"));
     const currency = textValue(dig(raw, "prices", "salePrice", "currencyCode"))
       || textValue(dig(raw, "prices", "originalPrice", "currencyCode"))
-      || parsedPrice.currency;
+      || parsedPrice.currency
+      || originalPrice.currency;
     const href = textValue(dig(raw, "productDetailUrl")) || `/item/${id}.html`;
     const seller = textValue(dig(raw, "store", "storeName"));
     const rating = ratingFrom(textValue(dig(raw, "evaluation", "starRating")) || textValue(dig(raw, "evaluation", "averageStar")));
@@ -189,8 +281,8 @@ function aliRunParams(html: string, limit: number): Listing[] {
       url: canonical("https://www.aliexpress.com", href),
       image_url: imageURL(image),
       seller: seller || undefined,
-      price_minor: parsedPrice.minor,
-      original_price_minor: originalPrice.minor,
+      price_minor: saleMinor,
+      original_price_minor: originalMinor,
       currency: currency || undefined,
       available: true,
       rating,
@@ -269,9 +361,10 @@ function aliDOM(html: string, limit: number): Listing[] {
 }
 
 export function parseAliExpress(html: string, limit: number): Listing[] {
-  const structured = aliRunParams(html, limit);
+  const initData = aliStructuredListings(aliInitDataRoot(html), limit);
+  const runParams = aliStructuredListings(aliRunParamsRoot(html), limit);
   const dom = aliDOM(html, limit);
-  return dedupe([...structured, ...dom], limit);
+  return dedupe([...initData, ...runParams, ...dom], limit);
 }
 
 export function parseEbay(html: string, limit: number): Listing[] {
