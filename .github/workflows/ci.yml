@@ -43,6 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: bash -n deploy/lxc/install.sh deploy/lxc/smoke.sh deploy/proxmox/create-lxc.sh
       - run: cp .env.example .env
       - run: docker compose config --quiet
       - run: docker compose -f compose.worker.yml config --quiet
