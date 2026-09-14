@@ -103,11 +103,14 @@ export function parseAmazon(html: string, limit: number): Listing[] {
     const priceText = compact(card.find(".a-price .a-offscreen").first().text())
       || compact(card.find(".a-price").first().text());
     const price = money(priceText);
+    const originalPrice = money(compact(card.find(".a-text-price .a-offscreen").first().text()));
     const ratingText = compact(card.find('[aria-label*="out of 5 stars"]').first().attr("aria-label"))
       || compact(card.find(".a-icon-alt").first().text());
     const reviewText = compact(card.find('[aria-label*="ratings"]').first().attr("aria-label"))
       || compact(card.find('a[href*="customerReviews"] span').last().text())
       || compact(card.find(".a-size-base.s-underline-text").first().text());
+    const sponsored = card.find('.puis-sponsored-label-text, .s-label-popover-default, [data-component-type="sp-sponsored-result"]').length > 0
+      || /\bsponsored\b/i.test(compact(card.find('[aria-label*="Sponsored"], [class*="sponsored"]').first().text()));
 
     out.push({
       marketplace: "amazon",
@@ -116,10 +119,12 @@ export function parseAmazon(html: string, limit: number): Listing[] {
       url: canonical("https://www.amazon.com", href),
       image_url: imageURL(card.find("img.s-image").first().attr("src") ?? ""),
       price_minor: price.minor,
-      currency: price.currency,
+      original_price_minor: originalPrice.minor,
+      currency: price.currency || originalPrice.currency,
       available: true,
       rating: ratingFrom(ratingText),
       review_count: countFrom(reviewText),
+      sponsored,
     });
   });
   return dedupe(out, limit);
@@ -163,14 +168,18 @@ function aliRunParams(html: string, limit: number): Listing[] {
     const title = textValue(dig(raw, "title", "displayTitle")) || textValue(dig(raw, "title", "seoTitle"));
     if (!id || !title) continue;
 
-    const formattedPrice = textValue(dig(raw, "prices", "salePrice", "formattedPrice"))
-      || textValue(dig(raw, "prices", "originalPrice", "formattedPrice"));
-    const parsedPrice = money(formattedPrice);
-    const currency = textValue(dig(raw, "prices", "salePrice", "currencyCode")) || parsedPrice.currency;
+    const salePriceText = textValue(dig(raw, "prices", "salePrice", "formattedPrice"));
+    const originalPriceText = textValue(dig(raw, "prices", "originalPrice", "formattedPrice"));
+    const parsedPrice = money(salePriceText || originalPriceText);
+    const originalPrice = money(originalPriceText);
+    const currency = textValue(dig(raw, "prices", "salePrice", "currencyCode"))
+      || textValue(dig(raw, "prices", "originalPrice", "currencyCode"))
+      || parsedPrice.currency;
     const href = textValue(dig(raw, "productDetailUrl")) || `/item/${id}.html`;
     const seller = textValue(dig(raw, "store", "storeName"));
     const rating = ratingFrom(textValue(dig(raw, "evaluation", "starRating")) || textValue(dig(raw, "evaluation", "averageStar")));
     const reviews = countFrom(textValue(dig(raw, "evaluation", "evaluationCount")) || textValue(dig(raw, "evaluation", "totalValidNum")));
+    const sold = countFrom(textValue(dig(raw, "trade", "tradeDesc")) || textValue(dig(raw, "trade", "tradeCount")));
     const image = textValue(dig(raw, "image", "imgUrl")) || textValue(dig(raw, "image", "imageUrl"));
 
     out.push({
@@ -181,10 +190,12 @@ function aliRunParams(html: string, limit: number): Listing[] {
       image_url: imageURL(image),
       seller: seller || undefined,
       price_minor: parsedPrice.minor,
+      original_price_minor: originalPrice.minor,
       currency: currency || undefined,
       available: true,
       rating,
       review_count: reviews,
+      sold_count: sold,
     });
   }
   return out;
@@ -228,10 +239,13 @@ function aliDOM(html: string, limit: number): Listing[] {
 
     const priceText = compact(card.find('[class*="price"]').first().text()) || compact(card.text());
     const price = money(priceText);
+    const originalPrice = money(compact(card.find('[class*="original"], [class*="old-price"], del, s').first().text()));
     const shippingText = compact(card.find('[class*="shipping"]').first().text());
     const shipping = /free\s+shipping/i.test(shippingText) ? { minor: 0, currency: price.currency } : money(shippingText);
     const seller = compact(card.find('[class*="store"], [class*="shop"]').first().text());
     const ratingText = compact(card.find('[class*="rating"], [class*="star"]').first().text());
+    const reviewText = compact(card.find('[class*="review"], [class*="evaluation"]').first().text());
+    const soldText = compact(card.find('[class*="sold"], [class*="trade"]').first().text());
     const rawImage = image.attr("src") ?? image.attr("data-src") ?? image.attr("data-lazy-src") ?? "";
 
     out.push({
@@ -242,10 +256,13 @@ function aliDOM(html: string, limit: number): Listing[] {
       image_url: imageURL(rawImage),
       seller: seller || undefined,
       price_minor: price.minor,
+      original_price_minor: originalPrice.minor,
       shipping_minor: shipping.minor,
-      currency: price.currency,
+      currency: price.currency || originalPrice.currency,
       available: true,
       rating: ratingFrom(ratingText),
+      review_count: countFrom(reviewText),
+      sold_count: countFrom(soldText),
     });
   });
   return out;
