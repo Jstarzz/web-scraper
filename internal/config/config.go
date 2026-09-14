@@ -15,6 +15,8 @@ type Config struct {
 	WorkerID              string
 	WorkerConcurrency     int
 	WorkerPollInterval    time.Duration
+	WorkerMaxAttempts     int
+	WorkerRetryBase       time.Duration
 	BrowserWorkerURL      string
 	BrowserRequestTimeout time.Duration
 }
@@ -28,6 +30,8 @@ func Load() (Config, error) {
 		WorkerID:              env("WORKER_ID", hostname()),
 		WorkerConcurrency:     envInt("WORKER_CONCURRENCY", 4),
 		WorkerPollInterval:    envDuration("WORKER_POLL_INTERVAL", 500*time.Millisecond),
+		WorkerMaxAttempts:     envInt("WORKER_MAX_ATTEMPTS", 3),
+		WorkerRetryBase:       envDuration("WORKER_RETRY_BASE", time.Second),
 		BrowserWorkerURL:      env("BROWSER_WORKER_URL", "http://browser-worker:3000"),
 		BrowserRequestTimeout: envDuration("BROWSER_REQUEST_TIMEOUT", 45*time.Second),
 	}
@@ -39,6 +43,12 @@ func Load() (Config, error) {
 	}
 	if cfg.WorkerConcurrency < 1 || cfg.WorkerConcurrency > 64 {
 		return Config{}, fmt.Errorf("WORKER_CONCURRENCY must be between 1 and 64")
+	}
+	if cfg.WorkerMaxAttempts < 1 || cfg.WorkerMaxAttempts > 5 {
+		return Config{}, fmt.Errorf("WORKER_MAX_ATTEMPTS must be between 1 and 5")
+	}
+	if cfg.WorkerRetryBase < 100*time.Millisecond || cfg.WorkerRetryBase > 30*time.Second {
+		return Config{}, fmt.Errorf("WORKER_RETRY_BASE must be between 100ms and 30s")
 	}
 	return cfg, nil
 }
