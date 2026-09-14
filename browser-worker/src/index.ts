@@ -11,10 +11,18 @@ const httpFastPath = !/^(0|false|no)$/i.test(process.env.HTTP_FAST_PATH ?? "true
 const blockImages = !/^(0|false|no)$/i.test(process.env.BROWSER_BLOCK_IMAGES ?? "true");
 const maxHTMLBytes = Math.max(1 << 20, Number(process.env.MAX_HTML_BYTES ?? 8 << 20));
 const userAgent = process.env.SCRAPER_USER_AGENT || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36";
+const requestJitterMs = Math.max(0, Number(process.env.REQUEST_JITTER_MS ?? 100));
+const marketplaceMinIntervalMs: Record<Marketplace, number> = {
+  amazon: Math.max(0, Number(process.env.AMAZON_MIN_INTERVAL_MS ?? 350)),
+  aliexpress: Math.max(0, Number(process.env.ALIEXPRESS_MIN_INTERVAL_MS ?? 300)),
+  ebay: Math.max(0, Number(process.env.EBAY_MIN_INTERVAL_MS ?? 200)),
+};
 
 let browser: Browser;
 let active = 0;
 const waiters: Array<() => void> = [];
+const nextRequestAt = new Map<Marketplace, number>();
+const pacingTails = new Map<Marketplace, Promise<void>>();
 
 async function acquire(): Promise<void> {
   if (active < concurrency) {
@@ -28,6 +36,33 @@ async function acquire(): Promise<void> {
 function release(): void {
   active--;
   waiters.shift()?.();
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pace(marketplace: Marketplace): Promise<void> {
+  const previous = pacingTails.get(marketplace) ?? Promise.resolve();
+  let releaseTurn!: () => void;
+  const turn = new Promise<void>((resolve) => { releaseTurn = resolve; });
+  const tail = previous.then(() => turn);
+  pacingTails.set(marketplace, tail);
+
+  await previous;
+  try {
+    const wait = Math.max(0, (nextRequestAt.get(marketplace) ?? 0) - Date.now());
+    if (wait > 0) await delay(wait);
+    const jitter = requestJitterMs > 0 ? Math.floor(Math.random() * (requestJitterMs + 1)) : 0;
+    nextRequestAt.set(marketplace, Date.now() + marketplaceMinIntervalMs[marketplace] + jitter);
+  } finally {
+    releaseTurn();
+    if (pacingTails.get(marketplace) === tail) {
+      void tail.finally(() => {
+        if (pacingTails.get(marketplace) === tail) pacingTails.delete(marketplace);
+      });
+    }
+  }
 }
 
 function searchURL(marketplace: Marketplace, query: string): string {
@@ -56,7 +91,34 @@ function looksChallenged(html: string): boolean {
     || sample.includes("baxia");
 }
 
+async function readBoundedHTML(response: Response): Promise<string> {
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  if (contentLength > maxHTMLBytes) throw new Error(`HTTP fast path response too large: ${contentLength}`);
+  if (!response.body) return response.text();
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxHTMLBytes) {
+        await reader.cancel("response exceeded configured HTML limit");
+        throw new Error(`HTTP fast path response exceeded ${maxHTMLBytes} bytes`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+}
+
 async function directHTML(marketplace: Marketplace, query: string): Promise<string> {
+  await pace(marketplace);
   const response = await fetch(searchURL(marketplace, query), {
     redirect: "follow",
     signal: AbortSignal.timeout(httpTimeout),
@@ -68,10 +130,7 @@ async function directHTML(marketplace: Marketplace, query: string): Promise<stri
     },
   });
   if (!response.ok) throw new Error(`HTTP fast path status ${response.status}`);
-  const contentLength = Number(response.headers.get("content-length") ?? 0);
-  if (contentLength > maxHTMLBytes) throw new Error(`HTTP fast path response too large: ${contentLength}`);
-  const html = await response.text();
-  if (html.length > maxHTMLBytes) throw new Error(`HTTP fast path response exceeded ${maxHTMLBytes} bytes`);
+  const html = await readBoundedHTML(response);
   if (looksChallenged(html)) throw new Error("HTTP fast path received a challenge page");
   return html;
 }
@@ -97,6 +156,7 @@ async function waitForMarketplace(page: Page, marketplace: Marketplace): Promise
 }
 
 async function browserHTML(marketplace: Marketplace, query: string): Promise<string> {
+  await pace(marketplace);
   await acquire();
   try {
     const context = await browser.newContext({
@@ -112,9 +172,15 @@ async function browserHTML(marketplace: Marketplace, query: string): Promise<str
       else await route.continue();
     });
     try {
-      await page.goto(searchURL(marketplace, query), { waitUntil: "domcontentloaded", timeout: navTimeout });
+      const response = await page.goto(searchURL(marketplace, query), { waitUntil: "domcontentloaded", timeout: navTimeout });
+      if (response && response.status() >= 400) {
+        throw new Error(`browser navigation status ${response.status()}`);
+      }
       await waitForMarketplace(page, marketplace);
       const html = await page.content();
+      if (Buffer.byteLength(html, "utf8") > maxHTMLBytes) {
+        throw new Error(`browser HTML exceeded ${maxHTMLBytes} bytes`);
+      }
       if (looksChallenged(html)) throw new Error("browser received a challenge page");
       return html;
     } finally {
@@ -182,7 +248,17 @@ browser = await chromium.launch({ headless: true });
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/healthz") {
-      json(res, 200, { ok: true, active, concurrency, http_fast_path: httpFastPath, block_images: blockImages, http_timeout_ms: httpTimeout });
+      json(res, 200, {
+        ok: true,
+        active,
+        concurrency,
+        http_fast_path: httpFastPath,
+        block_images: blockImages,
+        http_timeout_ms: httpTimeout,
+        max_html_bytes: maxHTMLBytes,
+        request_jitter_ms: requestJitterMs,
+        marketplace_min_interval_ms: marketplaceMinIntervalMs,
+      });
       return;
     }
     if (req.method !== "POST" || req.url !== "/scrape") {
