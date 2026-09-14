@@ -30,8 +30,11 @@ Most extraction work is concentrated on Amazon and AliExpress:
 
 - plain HTTP is attempted first for throughput and low RAM usage;
 - Chromium/Playwright is the fallback when the HTTP response is thin or unusable;
+- browser fallback blocks image/font/media transfers by default while keeping image URLs available in markup;
 - Amazon uses the current `data-component-type="s-search-result"` structure plus a `data-asin` fallback;
-- AliExpress prefers the structured `window.runParams -> mods.itemList.content` payload when present, then falls back to rendered DOM cards;
+- Amazon returns current/list prices, rating/review data and a sponsored-result flag when present;
+- AliExpress prefers the structured `window.runParams -> mods.itemList.content` payload when present, then falls back to hydrated DOM cards;
+- AliExpress returns sale/original prices, seller, rating/review count and sold count when present;
 - known challenge/verification pages are detected and treated as failures rather than being stored as product data;
 - structured and DOM results are deduplicated by marketplace product ID.
 
@@ -42,6 +45,7 @@ The service does not implement CAPTCHA solving, fingerprint spoofing, login auto
 - Go API and distributed worker binaries.
 - PostgreSQL-backed job queue safe for multiple workers.
 - Per-client API keys: secrets are generated once, SHA-256 hashes are persisted, and each client gets an independent rate limit.
+- Admin key inventory and revocation without exposing stored plaintext secrets.
 - 60-day configurable product observation history.
 - Change-only history writes plus a 24-hour heartbeat to avoid wasting storage.
 - HTTP-first + Playwright extraction worker for Amazon and AliExpress; eBay remains supported as a lighter fallback path.
@@ -51,7 +55,7 @@ The service does not implement CAPTCHA solving, fingerprint spoofing, login auto
 - Separate worker-only Compose file for a 4-core / 8 GB secondary node.
 - Proxmox LXC bootstrap installer.
 - Parser regression tests for Amazon and AliExpress.
-- CI for Go tests/vet and TypeScript/parser tests.
+- CI for Go tests/vet, TypeScript/parser tests, Compose validation, and container image builds.
 
 ## API
 
@@ -64,7 +68,21 @@ curl -X POST http://127.0.0.1:8080/admin/api-keys \
   -d '{"name":"josiah-mcp","rate_limit_per_minute":300}'
 ```
 
-The returned `key` is shown once. Keep it outside git.
+The returned `key` is shown once. Keep it outside git. Create separate keys for each consumer rather than sharing one secret.
+
+List client keys and their last-use/revocation state:
+
+```bash
+curl http://127.0.0.1:8080/admin/api-keys \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+Revoke one without deleting its audit record:
+
+```bash
+curl -X DELETE http://127.0.0.1:8080/admin/api-keys/KEY_UUID \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
 
 Search and wait up to 12 seconds for completion:
 
