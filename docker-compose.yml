@@ -38,7 +38,7 @@ services:
       db:
         condition: service_healthy
       browser-worker:
-        condition: service_started
+        condition: service_healthy
 
   browser-worker:
     build: ./browser-worker
@@ -47,7 +47,17 @@ services:
       BROWSER_PORT: ${BROWSER_PORT:-3000}
       BROWSER_CONCURRENCY: ${BROWSER_CONCURRENCY:-4}
       BROWSER_NAV_TIMEOUT_MS: ${BROWSER_NAV_TIMEOUT_MS:-30000}
+      HTTP_FAST_PATH: ${HTTP_FAST_PATH:-true}
+      HTTP_FAST_TIMEOUT_MS: ${HTTP_FAST_TIMEOUT_MS:-12000}
+      MAX_HTML_BYTES: ${MAX_HTML_BYTES:-8388608}
+      SCRAPER_USER_AGENT: ${SCRAPER_USER_AGENT:-}
     shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 15
+      start_period: 15s
 
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -57,4 +67,5 @@ services:
     environment:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN}
     depends_on:
-      - api
+      api:
+        condition: service_started

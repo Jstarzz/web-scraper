@@ -9,7 +9,7 @@ const navTimeout = Math.max(5_000, Number(process.env.BROWSER_NAV_TIMEOUT_MS ?? 
 const httpTimeout = Math.max(2_000, Number(process.env.HTTP_FAST_TIMEOUT_MS ?? 12_000));
 const httpFastPath = !/^(0|false|no)$/i.test(process.env.HTTP_FAST_PATH ?? "true");
 const maxHTMLBytes = Math.max(1 << 20, Number(process.env.MAX_HTML_BYTES ?? 8 << 20));
-const userAgent = process.env.SCRAPER_USER_AGENT ?? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36";
+const userAgent = process.env.SCRAPER_USER_AGENT || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36";
 
 let browser: Browser;
 let active = 0;

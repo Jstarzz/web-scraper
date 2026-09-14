@@ -6,7 +6,9 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   exit 1
 fi
 
-ROOT_DIR="${SCRAPER_ROOT:-/opt/web-scraper}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+ROOT_DIR="${SCRAPER_ROOT:-${REPO_DIR}}"
 DATA_DIR="${SCRAPER_DATA_DIR:-/srv/web-scraper/postgres}"
 CLIENT_NAME="${BOOTSTRAP_CLIENT_NAME:-josiah-mcp}"
 
@@ -23,16 +25,18 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p "$DATA_DIR"
 cd "$ROOT_DIR"
+mkdir -p "$DATA_DIR"
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
   POSTGRES_PASSWORD="$(openssl rand -hex 24)"
   ADMIN_TOKEN="$(openssl rand -hex 32)"
   sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${POSTGRES_PASSWORD}|" .env
+  sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgres://scraper:${POSTGRES_PASSWORD}@db:5432/scraper?sslmode=disable|" .env
   sed -i "s|^ADMIN_TOKEN=.*|ADMIN_TOKEN=${ADMIN_TOKEN}|" .env
   sed -i "s|^SCRAPER_DATA_DIR=.*|SCRAPER_DATA_DIR=${DATA_DIR}|" .env
+  chmod 600 .env
   echo "Created .env with generated database/admin secrets. Add TUNNEL_TOKEN before enabling the tunnel profile."
 fi
 
@@ -45,7 +49,7 @@ else
   docker compose up -d --build
 fi
 
-for _ in $(seq 1 60); do
+for _ in $(seq 1 90); do
   if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
     break
   fi
