@@ -14,11 +14,14 @@ export interface Listing {
   image_url?: string;
   seller?: string;
   price_minor?: number;
+  original_price_minor?: number;
   shipping_minor?: number;
   currency?: string;
   available?: boolean;
   rating?: number;
   review_count?: number;
+  sold_count?: number;
+  sponsored?: boolean;
 }
 
 export interface ScrapeResult {
