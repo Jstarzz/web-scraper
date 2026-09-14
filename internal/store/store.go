@@ -145,7 +145,7 @@ func (s *Store) FailJob(ctx context.Context, id, message string) error {
 }
 
 func (s *Store) RequeueStaleJobs(ctx context.Context, olderThan time.Duration) (int64,error) {
-	result, err := s.pool.Exec(ctx, `UPDATE scrape_jobs SET status='queued',claimed_at=NULL,worker_id=NULL,error='requeued after stale worker claim' WHERE status='running' AND claimed_at < now()-$1::interval`, olderThan.String())
+	result, err := s.pool.Exec(ctx, `UPDATE scrape_jobs SET status='queued',claimed_at=NULL,worker_id=NULL,error='requeued after stale worker claim' WHERE status='running' AND claimed_at < now()-($1 * interval '1 second')`, olderThan.Seconds())
 	if err != nil { return 0,err }
 	return result.RowsAffected(),nil
 }
