@@ -12,9 +12,17 @@ ROOT_DIR="${SCRAPER_ROOT:-${REPO_DIR}}"
 DATA_DIR="${SCRAPER_DATA_DIR:-/srv/web-scraper/postgres}"
 CLIENT_NAME="${BOOTSTRAP_CLIENT_NAME:-josiah-mcp}"
 
-if ! command -v docker >/dev/null 2>&1; then
+install_tools() {
   apt-get update
-  apt-get install -y ca-certificates curl git openssl
+  apt-get install -y ca-certificates curl git jq openssl
+}
+
+if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+  install_tools
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  install_tools
   curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
   sh /tmp/get-docker.sh
   rm -f /tmp/get-docker.sh
@@ -40,8 +48,13 @@ if [[ ! -f .env ]]; then
   echo "Created .env with generated database/admin secrets. Add TUNNEL_TOKEN before enabling the tunnel profile."
 fi
 
-mkdir -p "$DATA_DIR"
-chmod 700 "$DATA_DIR"
+# A bind-mounted PostgreSQL directory owned root:root with mode 0700 is not writable by
+# the postgres user inside the container. Let the exact image resolve its own postgres UID/GID.
+docker pull postgres:17-alpine >/dev/null
+docker run --rm --entrypoint sh \
+  -v "$DATA_DIR:/var/lib/postgresql/data" \
+  postgres:17-alpine \
+  -c 'chown postgres:postgres /var/lib/postgresql/data && chmod 700 /var/lib/postgresql/data'
 
 if grep -Eq '^TUNNEL_TOKEN=.+$' .env; then
   docker compose --profile tunnel up -d --build
@@ -50,31 +63,57 @@ else
 fi
 
 for _ in $(seq 1 90); do
-  if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+  if curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1; then
     break
   fi
   sleep 2
 done
 
-if ! curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
-  echo "API did not become healthy. Run: docker compose logs --tail=200" >&2
+if ! curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1; then
+  echo "API/database did not become ready. Run: docker compose logs --tail=200" >&2
+  exit 1
+fi
+
+for _ in $(seq 1 45); do
+  if docker compose exec -T browser-worker node -e "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+
+if ! docker compose exec -T browser-worker node -e "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1; then
+  echo "Extraction worker did not become healthy. Run: docker compose logs --tail=200 browser-worker worker" >&2
+  exit 1
+fi
+
+if [[ -z "$(docker compose ps --status running -q worker)" ]]; then
+  echo "Go worker is not running. Run: docker compose logs --tail=200 worker" >&2
   exit 1
 fi
 
 if [[ ! -f .bootstrap-client-created ]]; then
   ADMIN_TOKEN="$(sed -n 's/^ADMIN_TOKEN=//p' .env | head -n1)"
   echo
-  echo "Bootstrap API key (save the returned ws_live_ value now; it is only returned once):"
-  curl -fsS -X POST http://127.0.0.1:8080/admin/api-keys \
+  echo "Creating bootstrap API key for ${CLIENT_NAME}..."
+  BOOTSTRAP_RESPONSE="$(curl -fsS -X POST http://127.0.0.1:8080/admin/api-keys \
     -H "Authorization: Bearer ${ADMIN_TOKEN}" \
     -H "Content-Type: application/json" \
-    -d "{\"name\":\"${CLIENT_NAME}\",\"rate_limit_per_minute\":300}"
-  echo
+    -d "{\"name\":\"${CLIENT_NAME}\",\"rate_limit_per_minute\":300}")"
+  CLIENT_KEY="$(printf '%s' "$BOOTSTRAP_RESPONSE" | jq -er '.key')"
   touch .bootstrap-client-created
+
+  echo
+  echo "Bootstrap client key created. Save this value now; the service stores only its hash:"
+  echo "$CLIENT_KEY"
+  echo
+  echo "For ebay-search-mcp after your Cloudflare hostname is configured:"
+  echo "AMAZON_SELFHOSTED_URL=https://YOUR_HOSTNAME/v1/search"
+  echo "ALIEXPRESS_SELFHOSTED_URL=https://YOUR_HOSTNAME/v1/search"
+  echo "SELFHOSTED_API_KEY=${CLIENT_KEY}"
 fi
 
 echo
 echo "web-scraper is running."
-echo "Local health: http://127.0.0.1:8080/healthz"
+echo "Local readiness: http://127.0.0.1:8080/readyz"
 echo "Data: ${DATA_DIR}"
 echo "If TUNNEL_TOKEN is configured, Cloudflare Tunnel is running as well."
