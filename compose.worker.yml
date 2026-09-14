@@ -25,6 +25,9 @@ services:
       ALIEXPRESS_MIN_INTERVAL_MS: ${ALIEXPRESS_MIN_INTERVAL_MS:-300}
       EBAY_MIN_INTERVAL_MS: ${EBAY_MIN_INTERVAL_MS:-200}
       REQUEST_JITTER_MS: ${REQUEST_JITTER_MS:-100}
+      AMAZON_MAX_CONCURRENT: ${AMAZON_MAX_CONCURRENT:-4}
+      ALIEXPRESS_MAX_CONCURRENT: ${ALIEXPRESS_MAX_CONCURRENT:-2}
+      EBAY_MAX_CONCURRENT: ${EBAY_MAX_CONCURRENT:-3}
     shm_size: "768mb"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
