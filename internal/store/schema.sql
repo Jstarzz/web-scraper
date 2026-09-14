@@ -48,13 +48,23 @@ CREATE TABLE IF NOT EXISTS observations (
     job_id uuid REFERENCES scrape_jobs(id) ON DELETE SET NULL,
     observed_at timestamptz NOT NULL DEFAULT now(),
     price_minor bigint,
+    original_price_minor bigint,
     shipping_minor bigint,
     currency text,
     available boolean,
     rating double precision,
     review_count bigint,
+    sold_count bigint,
+    sponsored boolean,
     source text NOT NULL
 );
+
+-- schema.sql is intentionally idempotent and doubles as the lightweight migration path
+-- for existing LXC installs created before these richer extraction fields existed.
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS original_price_minor bigint;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS sold_count bigint;
+ALTER TABLE observations ADD COLUMN IF NOT EXISTS sponsored boolean;
+
 CREATE INDEX IF NOT EXISTS observations_product_time_idx ON observations (product_id, observed_at DESC);
 CREATE INDEX IF NOT EXISTS observations_time_idx ON observations (observed_at);
 
