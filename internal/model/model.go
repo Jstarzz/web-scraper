@@ -47,12 +47,15 @@ type Worker struct {
 }
 
 type PricePoint struct {
-	ObservedAt  time.Time `json:"observed_at"`
-	PriceMinor  *int64    `json:"price_minor,omitempty"`
-	ShipMinor   *int64    `json:"shipping_minor,omitempty"`
-	Currency    string    `json:"currency,omitempty"`
-	Available   *bool     `json:"available,omitempty"`
-	Rating      *float64  `json:"rating,omitempty"`
-	ReviewCount *int64    `json:"review_count,omitempty"`
-	Source      string    `json:"source"`
+	ObservedAt         time.Time `json:"observed_at"`
+	PriceMinor         *int64    `json:"price_minor,omitempty"`
+	OriginalPriceMinor *int64    `json:"original_price_minor,omitempty"`
+	ShipMinor          *int64    `json:"shipping_minor,omitempty"`
+	Currency           string    `json:"currency,omitempty"`
+	Available          *bool     `json:"available,omitempty"`
+	Rating             *float64  `json:"rating,omitempty"`
+	ReviewCount        *int64    `json:"review_count,omitempty"`
+	SoldCount          *int64    `json:"sold_count,omitempty"`
+	Sponsored          *bool     `json:"sponsored,omitempty"`
+	Source             string    `json:"source"`
 }
