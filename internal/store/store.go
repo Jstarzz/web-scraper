@@ -120,16 +120,22 @@ func (s *Store) CompleteJob(ctx context.Context, job model.Job, listings []model
 			ON CONFLICT (marketplace,external_id) DO UPDATE SET canonical_url=EXCLUDED.canonical_url,title=EXCLUDED.title,image_url=COALESCE(EXCLUDED.image_url,products.image_url),seller=COALESCE(EXCLUDED.seller,products.seller),updated_at=now()
 			RETURNING id`, item.Marketplace,item.ExternalID,item.URL,item.Title,item.ImageURL,item.Seller).Scan(&productID)
 		if err != nil { return err }
-		_, err = tx.Exec(ctx, `INSERT INTO observations (product_id,job_id,price_minor,shipping_minor,currency,available,rating,review_count,source)
-			SELECT $1,$2::uuid,$3,$4,NULLIF($5,''),$6,$7,$8,$9
+		_, err = tx.Exec(ctx, `INSERT INTO observations (product_id,job_id,price_minor,original_price_minor,shipping_minor,currency,available,rating,review_count,sold_count,sponsored,source)
+			SELECT $1,$2::uuid,$3,$4,$5,NULLIF($6,''),$7,$8,$9,$10,$11,$12
 			WHERE NOT EXISTS (
 				SELECT 1 FROM observations o
 				WHERE o.id=(SELECT id FROM observations WHERE product_id=$1 ORDER BY observed_at DESC LIMIT 1)
-				AND o.price_minor IS NOT DISTINCT FROM $3 AND o.shipping_minor IS NOT DISTINCT FROM $4
-				AND o.currency IS NOT DISTINCT FROM NULLIF($5,'') AND o.available IS NOT DISTINCT FROM $6
-				AND o.rating IS NOT DISTINCT FROM $7 AND o.review_count IS NOT DISTINCT FROM $8
+				AND o.price_minor IS NOT DISTINCT FROM $3
+				AND o.original_price_minor IS NOT DISTINCT FROM $4
+				AND o.shipping_minor IS NOT DISTINCT FROM $5
+				AND o.currency IS NOT DISTINCT FROM NULLIF($6,'')
+				AND o.available IS NOT DISTINCT FROM $7
+				AND o.rating IS NOT DISTINCT FROM $8
+				AND o.review_count IS NOT DISTINCT FROM $9
+				AND o.sold_count IS NOT DISTINCT FROM $10
+				AND o.sponsored IS NOT DISTINCT FROM $11
 				AND o.observed_at > now()-interval '24 hours'
-			)`, productID,job.ID,item.PriceMinor,item.ShipMinor,item.Currency,item.Available,item.Rating,item.ReviewCount,item.Marketplace)
+			)`, productID,job.ID,item.PriceMinor,item.OriginalPriceMinor,item.ShipMinor,item.Currency,item.Available,item.Rating,item.ReviewCount,item.SoldCount,item.Sponsored,item.Marketplace)
 		if err != nil { return err }
 	}
 	payload, err := json.Marshal(listings)
@@ -166,10 +172,10 @@ func (s *Store) ListWorkers(ctx context.Context) ([]model.Worker,error) {
 
 func (s *Store) History(ctx context.Context, marketplace, externalID string, days int) ([]model.PricePoint,error) {
 	if days<1 {days=60}; if days>365 {days=365}
-	rows,err:=s.pool.Query(ctx,`SELECT o.observed_at,o.price_minor,o.shipping_minor,COALESCE(o.currency,''),o.available,o.rating,o.review_count,o.source FROM observations o JOIN products p ON p.id=o.product_id WHERE p.marketplace=$1 AND p.external_id=$2 AND o.observed_at >= now()-($3::text || ' days')::interval ORDER BY o.observed_at`,marketplace,externalID,days)
+	rows,err:=s.pool.Query(ctx,`SELECT o.observed_at,o.price_minor,o.original_price_minor,o.shipping_minor,COALESCE(o.currency,''),o.available,o.rating,o.review_count,o.sold_count,o.sponsored,o.source FROM observations o JOIN products p ON p.id=o.product_id WHERE p.marketplace=$1 AND p.external_id=$2 AND o.observed_at >= now()-($3::text || ' days')::interval ORDER BY o.observed_at`,marketplace,externalID,days)
 	if err!=nil{return nil,err}; defer rows.Close()
 	points:=[]model.PricePoint{}
-	for rows.Next(){var p model.PricePoint;if err:=rows.Scan(&p.ObservedAt,&p.PriceMinor,&p.ShipMinor,&p.Currency,&p.Available,&p.Rating,&p.ReviewCount,&p.Source);err!=nil{return nil,err};points=append(points,p)}
+	for rows.Next(){var p model.PricePoint;if err:=rows.Scan(&p.ObservedAt,&p.PriceMinor,&p.OriginalPriceMinor,&p.ShipMinor,&p.Currency,&p.Available,&p.Rating,&p.ReviewCount,&p.SoldCount,&p.Sponsored,&p.Source);err!=nil{return nil,err};points=append(points,p)}
 	return points,rows.Err()
 }
 
