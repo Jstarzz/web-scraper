@@ -1,0 +1,19 @@
+services:
+  worker:
+    build:
+      context: .
+      target: worker
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      browser-worker:
+        condition: service_started
+
+  browser-worker:
+    build: ./browser-worker
+    restart: unless-stopped
+    environment:
+      BROWSER_PORT: ${BROWSER_PORT:-3000}
+      BROWSER_CONCURRENCY: ${BROWSER_CONCURRENCY:-2}
+      BROWSER_NAV_TIMEOUT_MS: ${BROWSER_NAV_TIMEOUT_MS:-30000}
+    shm_size: "768mb"

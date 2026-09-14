@@ -1,0 +1,78 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+)
+
+type Config struct {
+	APIAddr               string
+	DatabaseURL           string
+	AdminToken            string
+	RetentionDays         int
+	WorkerID              string
+	WorkerPollInterval    time.Duration
+	BrowserWorkerURL      string
+	BrowserRequestTimeout time.Duration
+}
+
+func Load() (Config, error) {
+	cfg := Config{
+		APIAddr:               env("API_ADDR", ":8080"),
+		DatabaseURL:           os.Getenv("DATABASE_URL"),
+		AdminToken:            os.Getenv("ADMIN_TOKEN"),
+		RetentionDays:         envInt("RETENTION_DAYS", 60),
+		WorkerID:              env("WORKER_ID", hostname()),
+		WorkerPollInterval:    envDuration("WORKER_POLL_INTERVAL", 500*time.Millisecond),
+		BrowserWorkerURL:      env("BROWSER_WORKER_URL", "http://browser-worker:3000"),
+		BrowserRequestTimeout: envDuration("BROWSER_REQUEST_TIMEOUT", 45*time.Second),
+	}
+	if cfg.DatabaseURL == "" {
+		return Config{}, fmt.Errorf("DATABASE_URL is required")
+	}
+	if cfg.RetentionDays < 1 {
+		return Config{}, fmt.Errorf("RETENTION_DAYS must be >= 1")
+	}
+	return cfg, nil
+}
+
+func env(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func hostname() string {
+	name, err := os.Hostname()
+	if err != nil || name == "" {
+		return "worker"
+	}
+	return name
+}
