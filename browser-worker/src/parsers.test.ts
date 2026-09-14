@@ -32,7 +32,7 @@ test("uses Amazon data-asin fallback when component marker changes", () => {
   assert.equal(item.sponsored, false);
 });
 
-test("prefers AliExpress runParams search data", () => {
+test("parses legacy AliExpress runParams search data", () => {
   const runParams = {
     mods: {
       itemList: {
@@ -64,6 +64,44 @@ test("prefers AliExpress runParams search data", () => {
   assert.equal(item.review_count, 730);
   assert.equal(item.sold_count, 2_000);
   assert.equal(item.image_url, "https://ae.example/display.jpg");
+});
+
+test("parses current AliExpress _init_data_ hydration with nested root fields", () => {
+  const initData = {
+    data: {
+      root: {
+        fields: {
+          mods: {
+            itemList: {
+              content: [{
+                redirectedId: "1005007777777777",
+                title: { seoTitle: "RP2040 Development Board" },
+                prices: {
+                  salePrice: { minPrice: 8.75, currencyCode: "USD" },
+                  originalPrice: { minPrice: 12.5, currencyCode: "USD" }
+                },
+                trade: { tradeDesc: "3.4K sold" },
+                evaluation: { starRating: "4.6", evaluationCount: "512" },
+                image: { imgUrl: "//ae.example/rp2040.jpg" }
+              }]
+            }
+          }
+        }
+      }
+    }
+  };
+  const html = `<!-- init-data-start --><script>window._dida_config_={data:${JSON.stringify(initData)}};</script><!-- init-data-end -->`;
+  const [item] = parseAliExpress(html, 10);
+  assert.equal(item.external_id, "1005007777777777");
+  assert.equal(item.title, "RP2040 Development Board");
+  assert.equal(item.price_minor, 875);
+  assert.equal(item.original_price_minor, 1_250);
+  assert.equal(item.currency, "USD");
+  assert.equal(item.rating, 4.6);
+  assert.equal(item.review_count, 512);
+  assert.equal(item.sold_count, 3_400);
+  assert.equal(item.image_url, "https://ae.example/rp2040.jpg");
+  assert.equal(item.url, "https://www.aliexpress.com/item/1005007777777777.html");
 });
 
 test("parses and deduplicates AliExpress DOM cards", () => {
