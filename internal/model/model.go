@@ -6,7 +6,7 @@ type SearchRequest struct {
 	Marketplace string `json:"marketplace"`
 	Query       string `json:"query"`
 	Limit       int    `json:"limit"`
-	WaitMS      int    `json:"wait_ms,omitempty"`
+	WaitMS      *int   `json:"wait_ms,omitempty"`
 }
 
 type Listing struct {
