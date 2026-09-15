@@ -19,7 +19,11 @@ import (
 
 type contextKey string
 
-const apiKeyContext contextKey = "api-key"
+const (
+	apiKeyContext     contextKey = "api-key"
+	defaultWaitMS                = 12_000
+	maxSearchQueryLen            = 500
+)
 
 type Server struct {
 	store      *store.Store
@@ -57,19 +61,24 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	var req model.SearchRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	if err := decoder.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
 
 	req.Marketplace = strings.ToLower(strings.TrimSpace(req.Marketplace))
 	req.Query = strings.TrimSpace(req.Query)
-	if req.Marketplace != "amazon" && req.Marketplace != "aliexpress" && req.Marketplace != "ebay" {
+	if !validMarketplace(req.Marketplace) {
 		writeError(w, http.StatusBadRequest, "marketplace must be amazon, aliexpress, or ebay")
 		return
 	}
 	if req.Query == "" {
 		writeError(w, http.StatusBadRequest, "query is required")
+		return
+	}
+	if len(req.Query) > maxSearchQueryLen {
+		writeError(w, http.StatusBadRequest, "query must be at most 500 characters")
 		return
 	}
 	if req.Limit == 0 {
@@ -79,10 +88,12 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "limit must be 1..100")
 		return
 	}
-	if req.WaitMS == 0 {
-		req.WaitMS = 12000
+
+	waitMS := defaultWaitMS
+	if req.WaitMS != nil {
+		waitMS = *req.WaitMS
 	}
-	if req.WaitMS < 0 || req.WaitMS > 30000 {
+	if waitMS < 0 || waitMS > 30_000 {
 		writeError(w, http.StatusBadRequest, "wait_ms must be 0..30000")
 		return
 	}
@@ -93,32 +104,57 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not enqueue job")
 		return
 	}
-	if req.WaitMS == 0 {
+	if waitMS == 0 {
 		writeJSON(w, http.StatusAccepted, job)
 		return
 	}
 
-	deadline := time.Now().Add(time.Duration(req.WaitMS) * time.Millisecond)
-	for time.Now().Before(deadline) {
-		time.Sleep(100 * time.Millisecond)
-		current, err := s.store.GetJob(r.Context(), job.ID, key.ID)
-		if err != nil {
-			break
-		}
-		if current.Status == "complete" {
-			writeJSON(w, http.StatusOK, current)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	deadline := time.NewTimer(time.Duration(waitMS) * time.Millisecond)
+	defer ticker.Stop()
+	defer deadline.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
 			return
-		}
-		if current.Status == "failed" {
-			writeJSON(w, http.StatusBadGateway, current)
+		case <-ticker.C:
+			current, err := s.store.GetJob(r.Context(), job.ID, key.ID)
+			if err != nil {
+				if r.Context().Err() != nil {
+					return
+				}
+				writeError(w, http.StatusInternalServerError, "could not read queued job")
+				return
+			}
+			if writeTerminalJob(w, current) {
+				return
+			}
+		case <-deadline.C:
+			current, err := s.store.GetJob(r.Context(), job.ID, key.ID)
+			if err != nil {
+				current = job
+			}
+			if writeTerminalJob(w, current) {
+				return
+			}
+			writeJSON(w, http.StatusAccepted, current)
 			return
 		}
 	}
-	current, err := s.store.GetJob(r.Context(), job.ID, key.ID)
-	if err != nil {
-		current = job
+}
+
+func writeTerminalJob(w http.ResponseWriter, job model.Job) bool {
+	switch job.Status {
+	case "complete":
+		writeJSON(w, http.StatusOK, job)
+		return true
+	case "failed":
+		writeJSON(w, http.StatusBadGateway, job)
+		return true
+	default:
+		return false
 	}
-	writeJSON(w, http.StatusAccepted, current)
 }
 
 func (s *Server) job(w http.ResponseWriter, r *http.Request) {
@@ -136,22 +172,40 @@ func (s *Server) job(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {
+	marketplace := strings.ToLower(strings.TrimSpace(r.PathValue("marketplace")))
+	if !validMarketplace(marketplace) {
+		writeError(w, http.StatusBadRequest, "marketplace must be amazon, aliexpress, or ebay")
+		return
+	}
+	externalID := strings.TrimSpace(r.PathValue("externalID"))
+	if externalID == "" {
+		writeError(w, http.StatusBadRequest, "external id is required")
+		return
+	}
+
 	days := 60
 	if raw := r.URL.Query().Get("days"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil {
-			days = n
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 365 {
+			writeError(w, http.StatusBadRequest, "days must be 1..365")
+			return
 		}
+		days = n
 	}
-	points, err := s.store.History(r.Context(), r.PathValue("marketplace"), r.PathValue("externalID"), days)
+	points, err := s.store.History(r.Context(), marketplace, externalID, days)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read history")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"marketplace": r.PathValue("marketplace"),
-		"external_id": r.PathValue("externalID"),
+		"marketplace": marketplace,
+		"external_id": externalID,
 		"points":      points,
 	})
+}
+
+func validMarketplace(marketplace string) bool {
+	return marketplace == "amazon" || marketplace == "aliexpress" || marketplace == "ebay"
 }
 
 func (s *Server) createAPIKey(w http.ResponseWriter, r *http.Request) {
