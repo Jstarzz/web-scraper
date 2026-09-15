@@ -24,9 +24,17 @@ export interface Listing {
   sponsored?: boolean;
 }
 
+export interface ScrapeTimings {
+  direct_fetch_ms?: number;
+  direct_parse_ms?: number;
+  browser_fetch_ms?: number;
+  browser_parse_ms?: number;
+}
+
 export interface ScrapeResult {
   listings: Listing[];
   strategy: "http" | "browser" | "hybrid";
   direct_count: number;
   duration_ms: number;
+  timings?: ScrapeTimings;
 }
