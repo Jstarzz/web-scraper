@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - run: go mod tidy
+      - run: go test ./...
+      - run: go vet ./...
+
+  browser-worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: browser-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --package-lock-only --ignore-scripts
+      - run: npm ci --ignore-scripts
+      - run: npm test
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n deploy/lxc/install.sh deploy/lxc/smoke.sh deploy/proxmox/create-lxc.sh
+      - run: cp .env.example .env
+      - run: docker compose config --quiet
+      - run: docker compose -f compose.worker.yml config --quiet
+      - run: docker build --target api -t web-scraper-api:ci .
+      - run: docker build --target worker -t web-scraper-worker:ci .
+      - run: docker build -t web-scraper-browser:ci ./browser-worker
