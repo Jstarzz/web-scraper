@@ -1,9 +1,21 @@
 import type { Marketplace, ScrapeResult } from "./types.js";
 
+type Waiter = {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+};
+
+function abortError(signal?: AbortSignal): Error {
+  const reason = signal?.reason;
+  return reason instanceof Error ? reason : new Error("request aborted");
+}
+
 export class PermitPool {
   readonly limit: number;
   #active = 0;
-  #waiters: Array<() => void> = [];
+  #waiters: Waiter[] = [];
 
   constructor(limit: number) {
     if (!Number.isInteger(limit) || limit < 1) throw new Error("permit pool limit must be a positive integer");
@@ -18,20 +30,42 @@ export class PermitPool {
     return this.#waiters.length;
   }
 
-  async acquire(): Promise<void> {
+  async acquire(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw abortError(signal);
     if (this.#active < this.limit) {
       this.#active++;
       return;
     }
-    await new Promise<void>((resolve) => this.#waiters.push(resolve));
+
+    await new Promise<void>((resolve, reject) => {
+      const waiter: Waiter = {
+        resolve,
+        reject: (error) => reject(error),
+        signal,
+      };
+      if (signal) {
+        waiter.onAbort = () => {
+          const index = this.#waiters.indexOf(waiter);
+          if (index >= 0) this.#waiters.splice(index, 1);
+          reject(abortError(signal));
+        };
+        signal.addEventListener("abort", waiter.onAbort, { once: true });
+      }
+      this.#waiters.push(waiter);
+    });
     // release() transfers an existing permit directly to this waiter, so the
     // active count intentionally does not change here.
   }
 
   release(): void {
-    const next = this.#waiters.shift();
-    if (next) {
-      next();
+    while (this.#waiters.length) {
+      const next = this.#waiters.shift()!;
+      if (next.onAbort && next.signal) next.signal.removeEventListener("abort", next.onAbort);
+      if (next.signal?.aborted) {
+        next.reject(abortError(next.signal));
+        continue;
+      }
+      next.resolve();
       return;
     }
     if (this.#active <= 0) throw new Error("permit pool released without an active permit");
