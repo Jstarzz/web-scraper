@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Jstarzz/web-scraper/internal/model"
+	"github.com/Jstarzz/web-scraper/internal/policy"
 	"github.com/Jstarzz/web-scraper/internal/store"
 	"github.com/jackc/pgx/v5"
 )
@@ -20,9 +22,8 @@ import (
 type contextKey string
 
 const (
-	apiKeyContext     contextKey = "api-key"
-	defaultWaitMS                = 12_000
-	maxSearchQueryLen            = 500
+	apiKeyContext contextKey = "api-key"
+	defaultWaitMS            = 12_000
 )
 
 type Server struct {
@@ -60,27 +61,44 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) search(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Search-Policy-Version", policy.SearchPolicyVersion)
+	if clientVersion := strings.TrimSpace(r.Header.Get("X-Search-Policy-Version")); clientVersion != "" && clientVersion != policy.SearchPolicyVersion {
+		w.Header().Set("X-Search-Policy-Mismatch", "1")
+	}
+
+	if contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))); contentType != "" && !strings.HasPrefix(contentType, "application/json") {
+		writeError(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+		return
+	}
+
 	var req model.SearchRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10))
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
+		writeError(w, http.StatusBadRequest, "invalid JSON request")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "request body must contain one JSON object")
 		return
 	}
 
 	req.Marketplace = strings.ToLower(strings.TrimSpace(req.Marketplace))
-	req.Query = strings.TrimSpace(req.Query)
 	if !validMarketplace(req.Marketplace) {
 		writeError(w, http.StatusBadRequest, "marketplace must be amazon, aliexpress, or ebay")
 		return
 	}
-	if req.Query == "" {
-		writeError(w, http.StatusBadRequest, "query is required")
+
+	decision := policy.FilterSearchQuery(req.Query)
+	if decision.Rejection != nil {
+		writePolicyError(w, decision.Rejection)
 		return
 	}
-	if len(req.Query) > maxSearchQueryLen {
-		writeError(w, http.StatusBadRequest, "query must be at most 500 characters")
-		return
+	req.Query = decision.Query
+	if decision.Normalized {
+		w.Header().Set("X-Search-Normalized", "1")
 	}
+
 	if req.Limit == 0 {
 		req.Limit = 20
 	}
@@ -311,6 +329,14 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": message})
+}
+
+func writePolicyError(w http.ResponseWriter, rejection *policy.Rejection) {
+	writeJSON(w, http.StatusBadRequest, map[string]any{
+		"error":   "request_rejected",
+		"code":    rejection.Code,
+		"message": rejection.Message,
+	})
 }
 
 func requestLog(log *slog.Logger, next http.Handler) http.Handler {
