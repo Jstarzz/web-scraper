@@ -41,7 +41,7 @@ func main() {
 
 	client := browser.New(cfg.BrowserWorkerURL, cfg.BrowserRequestTimeout)
 	capabilities := []string{"amazon", "aliexpress", "ebay", "browser"}
-	go maintenance(root, st, cfg.RetentionDays, cfg.WorkerID, capabilities, log)
+	go maintenance(root, st, cfg, capabilities, log)
 
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.WorkerConcurrency; i++ {
@@ -51,7 +51,14 @@ func main() {
 			workerLoop(root, st, client, cfg, fmt.Sprintf("%s/%d", cfg.WorkerID, slot+1), log)
 		}(i)
 	}
-	log.Info("worker pool started", "worker", cfg.WorkerID, "concurrency", cfg.WorkerConcurrency, "max_attempts", cfg.WorkerMaxAttempts)
+	log.Info(
+		"worker pool started",
+		"worker", cfg.WorkerID,
+		"concurrency", cfg.WorkerConcurrency,
+		"max_attempts", cfg.WorkerMaxAttempts,
+		"heartbeat_interval", cfg.WorkerHeartbeatInterval,
+		"stale_after", cfg.WorkerStaleAfter,
+	)
 	<-root.Done()
 	wg.Wait()
 }
@@ -70,14 +77,27 @@ func workerLoop(root context.Context, st *store.Store, client *browser.Client, c
 		}
 
 		log.Info("scrape start", "worker", claimID, "job", job.ID, "marketplace", job.Marketplace, "query", job.Query)
+
+		jobCtx, cancelJob := context.WithCancel(root)
+		claimLost := make(chan error, 1)
+		go maintainJobClaim(jobCtx, cancelJob, st, job.ID, claimID, cfg.WorkerHeartbeatInterval, claimLost, log)
+
 		var listingsErr error
+	attemptLoop:
 		for attempt := 1; attempt <= cfg.WorkerMaxAttempts; attempt++ {
-			ctx, cancel := context.WithTimeout(root, cfg.BrowserRequestTimeout)
+			ctx, cancel := context.WithTimeout(jobCtx, cfg.BrowserRequestTimeout)
 			listings, listErr := client.Scrape(ctx, job)
 			cancel()
 
+			select {
+			case claimErr := <-claimLost:
+				listingsErr = claimErr
+				break attemptLoop
+			default:
+			}
+
 			if listErr == nil {
-				listingsErr = st.CompleteJob(root, job, listings)
+				listingsErr = st.CompleteJob(jobCtx, job, listings)
 				if listingsErr == nil {
 					log.Info("scrape complete", "worker", claimID, "job", job.ID, "listings", len(listings), "attempt", attempt)
 				}
@@ -85,15 +105,73 @@ func workerLoop(root context.Context, st *store.Store, client *browser.Client, c
 			}
 
 			listingsErr = listErr
+			if root.Err() != nil {
+				break
+			}
 			if attempt < cfg.WorkerMaxAttempts {
 				backoff := retryDelay(cfg.WorkerRetryBase, attempt)
-				log.Warn("scrape attempt failed; retrying", "worker", claimID, "job", job.ID, "marketplace", job.Marketplace, "attempt", attempt, "retry_in", backoff, "error", listErr)
-				sleep(root, backoff)
+				log.Warn(
+					"scrape attempt failed; retrying",
+					"worker", claimID,
+					"job", job.ID,
+					"marketplace", job.Marketplace,
+					"attempt", attempt,
+					"retry_in", backoff,
+					"error", listErr,
+				)
+				sleep(jobCtx, backoff)
 			}
 		}
-		if listingsErr != nil {
-			log.Warn("scrape failed", "worker", claimID, "job", job.ID, "error", listingsErr)
-			_ = st.FailJob(root, job.ID, listingsErr.Error())
+		cancelJob()
+
+		if listingsErr == nil {
+			continue
+		}
+		if errors.Is(listingsErr, store.ErrJobClaimLost) {
+			log.Warn("job claim lost; discarding stale result", "worker", claimID, "job", job.ID)
+			continue
+		}
+		if root.Err() != nil {
+			return
+		}
+
+		log.Warn("scrape failed", "worker", claimID, "job", job.ID, "error", listingsErr)
+		if err := st.FailJob(root, job.ID, claimID, listingsErr.Error()); err != nil && !errors.Is(err, store.ErrJobClaimLost) {
+			log.Error("mark job failed", "worker", claimID, "job", job.ID, "error", err)
+		}
+	}
+}
+
+func maintainJobClaim(
+	ctx context.Context,
+	cancelJob context.CancelFunc,
+	st *store.Store,
+	jobID string,
+	workerID string,
+	interval time.Duration,
+	claimLost chan<- error,
+	log *slog.Logger,
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := st.RefreshJobClaim(ctx, jobID, workerID)
+			if errors.Is(err, store.ErrJobClaimLost) {
+				select {
+				case claimLost <- err:
+				default:
+				}
+				cancelJob()
+				return
+			}
+			if err != nil && ctx.Err() == nil {
+				log.Warn("refresh job claim", "worker", workerID, "job", jobID, "error", err)
+			}
 		}
 	}
 }
@@ -110,20 +188,33 @@ func retryDelay(base time.Duration, attempt int) time.Duration {
 	return backoff + time.Duration(rand.Intn(500))*time.Millisecond
 }
 
-func maintenance(ctx context.Context, st *store.Store, retention int, workerID string, capabilities []string, log *slog.Logger) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	_ = st.TouchWorker(ctx, workerID, capabilities)
+func maintenance(ctx context.Context, st *store.Store, cfg config.Config, capabilities []string, log *slog.Logger) {
+	heartbeat := time.NewTicker(cfg.WorkerHeartbeatInterval)
+	prune := time.NewTicker(6 * time.Hour)
+	defer heartbeat.Stop()
+	defer prune.Stop()
+
+	if err := st.TouchWorker(ctx, cfg.WorkerID, capabilities); err != nil {
+		log.Warn("worker heartbeat", "worker", cfg.WorkerID, "error", err)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			_ = st.TouchWorker(ctx, workerID, capabilities)
-			if n, err := st.RequeueStaleJobs(ctx, 2*time.Minute); err == nil && n > 0 {
-				log.Warn("requeued stale jobs", "count", n)
+		case <-heartbeat.C:
+			if err := st.TouchWorker(ctx, cfg.WorkerID, capabilities); err != nil {
+				log.Warn("worker heartbeat", "worker", cfg.WorkerID, "error", err)
 			}
-			if n, err := st.PruneHistory(ctx, retention); err == nil && n > 0 {
+			if n, err := st.RequeueStaleJobs(ctx, cfg.WorkerStaleAfter); err != nil {
+				log.Warn("requeue stale jobs", "error", err)
+			} else if n > 0 {
+				log.Warn("requeued stale jobs", "count", n, "stale_after", cfg.WorkerStaleAfter)
+			}
+		case <-prune.C:
+			if n, err := st.PruneHistory(ctx, cfg.RetentionDays); err != nil {
+				log.Warn("prune observations", "error", err)
+			} else if n > 0 {
 				log.Info("pruned observations", "count", n)
 			}
 		}
@@ -131,10 +222,10 @@ func maintenance(ctx context.Context, st *store.Store, retention int, workerID s
 }
 
 func sleep(ctx context.Context, d time.Duration) {
-	t := time.NewTimer(d)
-	defer t.Stop()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-	case <-t.C:
+	case <-timer.C:
 	}
 }
