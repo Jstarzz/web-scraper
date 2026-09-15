@@ -244,22 +244,40 @@ async function scrape(input: ScrapeRequest, signal?: AbortSignal): Promise<Scrap
   const started = Date.now();
   const limit = input.limit ?? 20;
   const marketplace = input.marketplace;
+  const timings: NonNullable<ScrapeResult["timings"]> = {};
   let direct: Listing[] = [];
   let directError: string | undefined;
 
   if (httpFastPath && (marketplace === "amazon" || marketplace === "aliexpress")) {
+    const directStarted = Date.now();
     try {
-      direct = parse(marketplace, await directHTML(marketplace, input.query, signal), limit);
+      const directDocument = await directHTML(marketplace, input.query, signal);
+      timings.direct_path_ms = Date.now() - directStarted;
+      const parseStarted = Date.now();
+      direct = parse(marketplace, directDocument, limit);
+      timings.direct_parse_ms = Date.now() - parseStarted;
       if (enough(direct, limit)) {
-        return { listings: direct, strategy: "http", direct_count: direct.length, duration_ms: Date.now() - started };
+        return {
+          listings: direct,
+          strategy: "http",
+          direct_count: direct.length,
+          duration_ms: Date.now() - started,
+          timings,
+        };
       }
     } catch (error) {
+      timings.direct_path_ms ??= Date.now() - directStarted;
       if (signal?.aborted) throw error;
       directError = error instanceof Error ? error.message : String(error);
     }
   }
 
-  const browserListings = parse(marketplace, await browserHTML(marketplace, input.query, limit, signal), limit);
+  const browserStarted = Date.now();
+  const browserDocument = await browserHTML(marketplace, input.query, limit, signal);
+  timings.browser_path_ms = Date.now() - browserStarted;
+  const browserParseStarted = Date.now();
+  const browserListings = parse(marketplace, browserDocument, limit);
+  timings.browser_parse_ms = Date.now() - browserParseStarted;
   const listings = mergeListings(browserListings, direct, limit);
   if (!listings.length) throw new Error(`no listings extracted${directError ? `; fast path: ${directError}` : ""}`);
   return {
@@ -267,6 +285,7 @@ async function scrape(input: ScrapeRequest, signal?: AbortSignal): Promise<Scrap
     strategy: direct.length ? "hybrid" : "browser",
     direct_count: direct.length,
     duration_ms: Date.now() - started,
+    timings,
   };
 }
 
@@ -360,6 +379,7 @@ const server = http.createServer(async (req, res) => {
       listings: result.listings.length,
       direct_count: result.direct_count,
       duration_ms: result.duration_ms,
+      timings: result.timings,
     }));
     json(res, 200, result);
   } catch (error) {
