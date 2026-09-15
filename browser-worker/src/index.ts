@@ -1,6 +1,7 @@
 import http from "node:http";
-import { chromium, type Browser, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { mergeListings, parseAliExpress, parseAmazon, parseEbay } from "./parsers.js";
+import { PermitPool, ScrapeTelemetry } from "./runtime.js";
 import type { Listing, Marketplace, ScrapeRequest, ScrapeResult } from "./types.js";
 
 const port = Number(process.env.BROWSER_PORT ?? 3000);
@@ -24,47 +25,15 @@ const marketplaceConcurrency: Record<Marketplace, number> = {
 };
 
 let browser: Browser;
-let active = 0;
-const waiters: Array<() => void> = [];
+const browserPool = new PermitPool(concurrency);
+const marketplacePools: Record<Marketplace, PermitPool> = {
+  amazon: new PermitPool(marketplaceConcurrency.amazon),
+  aliexpress: new PermitPool(marketplaceConcurrency.aliexpress),
+  ebay: new PermitPool(marketplaceConcurrency.ebay),
+};
+const telemetry = new ScrapeTelemetry();
 const nextRequestAt = new Map<Marketplace, number>();
 const pacingTails = new Map<Marketplace, Promise<void>>();
-const marketplaceActive = new Map<Marketplace, number>();
-const marketplaceWaiters = new Map<Marketplace, Array<() => void>>();
-
-async function acquire(): Promise<void> {
-  if (active < concurrency) {
-    active++;
-    return;
-  }
-  await new Promise<void>((resolve) => waiters.push(resolve));
-  active++;
-}
-
-function release(): void {
-  active--;
-  waiters.shift()?.();
-}
-
-async function acquireMarketplace(marketplace: Marketplace): Promise<void> {
-  const current = marketplaceActive.get(marketplace) ?? 0;
-  if (current < marketplaceConcurrency[marketplace]) {
-    marketplaceActive.set(marketplace, current + 1);
-    return;
-  }
-  const queue = marketplaceWaiters.get(marketplace) ?? [];
-  await new Promise<void>((resolve) => queue.push(resolve));
-  marketplaceWaiters.set(marketplace, queue);
-  marketplaceActive.set(marketplace, (marketplaceActive.get(marketplace) ?? 0) + 1);
-}
-
-function releaseMarketplace(marketplace: Marketplace): void {
-  const current = marketplaceActive.get(marketplace) ?? 1;
-  marketplaceActive.set(marketplace, Math.max(0, current - 1));
-  const queue = marketplaceWaiters.get(marketplace);
-  const next = queue?.shift();
-  if (queue && queue.length === 0) marketplaceWaiters.delete(marketplace);
-  next?.();
-}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -145,13 +114,31 @@ async function readBoundedHTML(response: Response): Promise<string> {
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
 }
 
-async function directHTML(marketplace: Marketplace, query: string): Promise<string> {
+function timeoutSignal(parent: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error(`request timed out after ${timeoutMs}ms`)), timeoutMs);
+  const onAbort = () => controller.abort(parent?.reason ?? new Error("request aborted"));
+
+  if (parent?.aborted) onAbort();
+  else parent?.addEventListener("abort", onAbort, { once: true });
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timeout);
+      parent?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+async function directHTML(marketplace: Marketplace, query: string, signal?: AbortSignal): Promise<string> {
   await pace(marketplace);
-  await acquireMarketplace(marketplace);
+  await marketplacePools[marketplace].acquire(signal);
+  const bounded = timeoutSignal(signal, httpTimeout);
   try {
     const response = await fetch(searchURL(marketplace, query), {
       redirect: "follow",
-      signal: AbortSignal.timeout(httpTimeout),
+      signal: bounded.signal,
       headers: {
         "user-agent": userAgent,
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -164,7 +151,8 @@ async function directHTML(marketplace: Marketplace, query: string): Promise<stri
     if (looksChallenged(html)) throw new Error("HTTP fast path received a challenge page");
     return html;
   } finally {
-    releaseMarketplace(marketplace);
+    bounded.dispose();
+    marketplacePools[marketplace].release();
   }
 }
 
@@ -178,8 +166,6 @@ async function waitForMarketplace(page: Page, marketplace: Marketplace): Promise
   await page.locator(selector).first().waitFor({ state: "attached", timeout: Math.min(navTimeout, 8_000) }).catch(() => undefined);
 
   if (marketplace === "aliexpress") {
-    // AliExpress search cards hydrate progressively. This only runs on the browser fallback,
-    // so spending a few seconds here is preferable to returning a thin first paint.
     await page.waitForTimeout(800);
     for (let i = 0; i < 3; i++) {
       await page.evaluate(() => window.scrollBy(0, Math.max(900, window.innerHeight)));
@@ -188,41 +174,47 @@ async function waitForMarketplace(page: Page, marketplace: Marketplace): Promise
   }
 }
 
-async function browserHTML(marketplace: Marketplace, query: string): Promise<string> {
+async function browserHTML(marketplace: Marketplace, query: string, signal?: AbortSignal): Promise<string> {
   await pace(marketplace);
-  await acquireMarketplace(marketplace);
-  await acquire();
+  await marketplacePools[marketplace].acquire(signal);
+  let browserPermit = false;
+  let context: BrowserContext | undefined;
   try {
-    const context = await browser.newContext({
+    await browserPool.acquire(signal);
+    browserPermit = true;
+    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("request aborted");
+
+    context = await browser.newContext({
       locale: "en-US",
       userAgent,
       viewport: { width: 1365, height: 900 },
       serviceWorkers: "block",
     });
-    const page = await context.newPage();
-    await page.route("**/*", async (route) => {
-      const type = route.request().resourceType();
-      if (type === "font" || type === "media" || (blockImages && type === "image")) await route.abort();
-      else await route.continue();
-    });
+    const onAbort = () => void context?.close().catch(() => undefined);
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     try {
+      const page = await context.newPage();
+      await page.route("**/*", async (route) => {
+        const type = route.request().resourceType();
+        if (type === "font" || type === "media" || (blockImages && type === "image")) await route.abort();
+        else await route.continue();
+      });
+
       const response = await page.goto(searchURL(marketplace, query), { waitUntil: "domcontentloaded", timeout: navTimeout });
-      if (response && response.status() >= 400) {
-        throw new Error(`browser navigation status ${response.status()}`);
-      }
+      if (response && response.status() >= 400) throw new Error(`browser navigation status ${response.status()}`);
       await waitForMarketplace(page, marketplace);
       const html = await page.content();
-      if (Buffer.byteLength(html, "utf8") > maxHTMLBytes) {
-        throw new Error(`browser HTML exceeded ${maxHTMLBytes} bytes`);
-      }
+      if (Buffer.byteLength(html, "utf8") > maxHTMLBytes) throw new Error(`browser HTML exceeded ${maxHTMLBytes} bytes`);
       if (looksChallenged(html)) throw new Error("browser received a challenge page");
       return html;
     } finally {
-      await context.close();
+      signal?.removeEventListener("abort", onAbort);
+      await context.close().catch(() => undefined);
     }
   } finally {
-    release();
-    releaseMarketplace(marketplace);
+    if (browserPermit) browserPool.release();
+    marketplacePools[marketplace].release();
   }
 }
 
@@ -230,29 +222,28 @@ function enough(listings: Listing[], limit: number): boolean {
   return listings.length >= Math.min(limit, Math.max(3, Math.ceil(limit * 0.5)));
 }
 
-async function scrape(input: ScrapeRequest): Promise<ScrapeResult> {
+async function scrape(input: ScrapeRequest, signal?: AbortSignal): Promise<ScrapeResult> {
   const started = Date.now();
-  const limit = Math.max(1, Math.min(100, input.limit ?? 20));
+  const limit = input.limit ?? 20;
   const marketplace = input.marketplace;
   let direct: Listing[] = [];
   let directError: string | undefined;
 
   if (httpFastPath && (marketplace === "amazon" || marketplace === "aliexpress")) {
     try {
-      direct = parse(marketplace, await directHTML(marketplace, input.query), limit);
+      direct = parse(marketplace, await directHTML(marketplace, input.query, signal), limit);
       if (enough(direct, limit)) {
         return { listings: direct, strategy: "http", direct_count: direct.length, duration_ms: Date.now() - started };
       }
     } catch (error) {
+      if (signal?.aborted) throw error;
       directError = error instanceof Error ? error.message : String(error);
     }
   }
 
-  const browserListings = parse(marketplace, await browserHTML(marketplace, input.query), limit);
+  const browserListings = parse(marketplace, await browserHTML(marketplace, input.query, signal), limit);
   const listings = mergeListings(browserListings, direct, limit);
-  if (!listings.length) {
-    throw new Error(`no listings extracted${directError ? `; fast path: ${directError}` : ""}`);
-  }
+  if (!listings.length) throw new Error(`no listings extracted${directError ? `; fast path: ${directError}` : ""}`);
   return {
     listings,
     strategy: direct.length ? "hybrid" : "browser",
@@ -262,12 +253,13 @@ async function scrape(input: ScrapeRequest): Promise<ScrapeResult> {
 }
 
 function json(res: http.ServerResponse, status: number, payload: unknown): void {
+  if (res.destroyed || res.writableEnded) return;
   const responseBody = JSON.stringify(payload);
   res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(responseBody) });
   res.end(responseBody);
 }
 
-async function body(req: http.IncomingMessage): Promise<ScrapeRequest> {
+async function body(req: http.IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -276,52 +268,107 @@ async function body(req: http.IncomingMessage): Promise<ScrapeRequest> {
     if (total > 64 * 1024) throw new Error("request too large");
     chunks.push(value);
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as ScrapeRequest;
+  if (!chunks.length) throw new Error("request body is required");
+  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+}
+
+function validateScrapeRequest(value: unknown): ScrapeRequest | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const input = value as Partial<ScrapeRequest>;
+  if (!input.marketplace || !["amazon", "aliexpress", "ebay"].includes(input.marketplace)) return undefined;
+  if (typeof input.query !== "string") return undefined;
+  input.query = input.query.trim();
+  if (!input.query || input.query.length > 500) return undefined;
+  if (input.limit !== undefined && (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100)) return undefined;
+  return input as ScrapeRequest;
 }
 
 browser = await chromium.launch({ headless: true });
 const server = http.createServer(async (req, res) => {
+  const path = req.url?.split("?", 1)[0] ?? "/";
+  if (req.method === "GET" && (path === "/healthz" || path === "/readyz")) {
+    json(res, 200, {
+      ok: browser.isConnected(),
+      browser: browserPool.snapshot(),
+      marketplaces: Object.fromEntries((Object.entries(marketplacePools) as Array<[Marketplace, PermitPool]>).map(([marketplace, pool]) => [marketplace, pool.snapshot()])),
+      http_fast_path: httpFastPath,
+      block_images: blockImages,
+      http_timeout_ms: httpTimeout,
+      max_html_bytes: maxHTMLBytes,
+      request_jitter_ms: requestJitterMs,
+      marketplace_min_interval_ms: marketplaceMinIntervalMs,
+      telemetry: telemetry.snapshot(),
+    });
+    return;
+  }
+  if (req.method !== "POST" || path !== "/scrape") {
+    json(res, 404, { error: "not found" });
+    return;
+  }
+
+  let input: ScrapeRequest | undefined;
   try {
-    if (req.method === "GET" && req.url === "/healthz") {
-      json(res, 200, {
-        ok: true,
-        active,
-        concurrency,
-        http_fast_path: httpFastPath,
-        block_images: blockImages,
-        http_timeout_ms: httpTimeout,
-        max_html_bytes: maxHTMLBytes,
-        request_jitter_ms: requestJitterMs,
-        marketplace_min_interval_ms: marketplaceMinIntervalMs,
-        marketplace_max_concurrent: marketplaceConcurrency,
-        marketplace_active: Object.fromEntries(marketplaceActive),
-      });
-      return;
-    }
-    if (req.method !== "POST" || req.url !== "/scrape") {
-      json(res, 404, { error: "not found" });
-      return;
-    }
-    const input = await body(req);
-    if (!input.query || !["amazon", "aliexpress", "ebay"].includes(input.marketplace)) {
-      json(res, 400, { error: "valid marketplace and query are required" });
-      return;
-    }
-    const result = await scrape(input);
-    console.log(JSON.stringify({ level: "info", message: "scrape complete", marketplace: input.marketplace, query: input.query, strategy: result.strategy, listings: result.listings.length, direct_count: result.direct_count, duration_ms: result.duration_ms }));
+    input = validateScrapeRequest(await body(req));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    json(res, 400, { error: message === "request too large" ? message : "invalid JSON request" });
+    return;
+  }
+  if (!input) {
+    json(res, 400, { error: "marketplace must be amazon, aliexpress, or ebay; query must be 1..500 characters; limit must be 1..100" });
+    return;
+  }
+
+  const started = Date.now();
+  const controller = new AbortController();
+  const onClose = () => {
+    if (!res.writableEnded) controller.abort(new Error("client disconnected"));
+  };
+  res.once("close", onClose);
+  telemetry.request(input.marketplace);
+
+  try {
+    const result = await scrape(input, controller.signal);
+    telemetry.success(input.marketplace, result);
+    console.log(JSON.stringify({
+      level: "info",
+      message: "scrape complete",
+      marketplace: input.marketplace,
+      query: input.query,
+      strategy: result.strategy,
+      listings: result.listings.length,
+      direct_count: result.direct_count,
+      duration_ms: result.duration_ms,
+    }));
     json(res, 200, result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(JSON.stringify({ level: "warn", message: "scrape failed", error: message }));
-    json(res, 502, { error: message });
+    telemetry.failure(input.marketplace, error, Date.now() - started);
+    if (!controller.signal.aborted) {
+      console.warn(JSON.stringify({ level: "warn", message: "scrape failed", marketplace: input.marketplace, query: input.query, error: message }));
+      json(res, 502, { error: message });
+    }
+  } finally {
+    res.removeListener("close", onClose);
   }
 });
 
-server.listen(port, "0.0.0.0", () => console.log(JSON.stringify({ level: "info", message: "extraction worker listening", port, concurrency, http_fast_path: httpFastPath, block_images: blockImages, marketplace_max_concurrent: marketplaceConcurrency })));
+server.listen(port, "0.0.0.0", () => console.log(JSON.stringify({
+  level: "info",
+  message: "extraction worker listening",
+  port,
+  concurrency,
+  http_fast_path: httpFastPath,
+  block_images: blockImages,
+  marketplace_max_concurrent: marketplaceConcurrency,
+})));
+
+let shuttingDown = false;
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
-    server.close();
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     await browser.close();
-    process.exit(0);
   });
 }
