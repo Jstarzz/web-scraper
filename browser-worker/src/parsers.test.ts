@@ -104,6 +104,36 @@ test("parses current AliExpress _init_data_ hydration with nested root fields", 
   assert.equal(item.url, "https://www.aliexpress.com/item/1005007777777777.html");
 });
 
+test("uses DOM only to fill a partial structured AliExpress result set", () => {
+  const initData = {
+    data: {
+      root: {
+        fields: {
+          mods: {
+            itemList: {
+              content: [{
+                productId: "1005001111111111",
+                title: { displayTitle: "Structured ESP32 Board" },
+                prices: { salePrice: { minPrice: 10, currencyCode: "USD" } }
+              }]
+            }
+          }
+        }
+      }
+    }
+  };
+  const html = `
+    <!-- init-data-start --><script>window._dida_config_={data:${JSON.stringify(initData)}};</script><!-- init-data-end -->
+    <div class="search-card-item">
+      <a href="https://www.aliexpress.com/item/1005002222222222.html" title="DOM ESP32 Board"></a>
+      <div class="price-area">US $12.00</div>
+    </div>`;
+  const items = parseAliExpress(html, 2);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].external_id, "1005001111111111");
+  assert.equal(items[1].external_id, "1005002222222222");
+});
+
 test("parses and deduplicates AliExpress DOM cards", () => {
   const html = `
   <div class="search-card-item">
