@@ -248,7 +248,7 @@ async function scrape(input: ScrapeRequest, signal?: AbortSignal): Promise<Scrap
   let direct: Listing[] = [];
   let directError: string | undefined;
 
-  if (httpFastPath && (marketplace === "amazon" || marketplace === "aliexpress")) {
+  if (httpFastPath) {
     const directStarted = Date.now();
     try {
       const directDocument = await directHTML(marketplace, input.query, signal);
