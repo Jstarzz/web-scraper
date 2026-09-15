@@ -31,7 +31,7 @@ func Load() (Config, error) {
 		RetentionDays:           envInt("RETENTION_DAYS", 60),
 		WorkerID:                env("WORKER_ID", hostname()),
 		WorkerConcurrency:       envInt("WORKER_CONCURRENCY", 4),
-		WorkerPollInterval:      envDuration("WORKER_POLL_INTERVAL", 500*time.Millisecond),
+		WorkerPollInterval:      envDuration("WORKER_POLL_INTERVAL", 200*time.Millisecond),
 		WorkerMaxAttempts:       envInt("WORKER_MAX_ATTEMPTS", 3),
 		WorkerRetryBase:         envDuration("WORKER_RETRY_BASE", time.Second),
 		WorkerHeartbeatInterval: envDuration("WORKER_HEARTBEAT_INTERVAL", 20*time.Second),
