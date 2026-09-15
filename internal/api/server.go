@@ -39,7 +39,7 @@ func New(st *store.Store, adminToken string, log *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.Handle("POST /v1/search", s.withAPIKey(http.HandlerFunc(s.search)))
-	mux.Handle("GET /v1/jobs/{id}", s.withAPIKey(http.HandlerFunc(s.job)))
+	mux.HandleFunc("GET /v1/jobs/{id}", s.job)
 	mux.Handle("GET /v1/history/{marketplace}/{externalID}", s.withAPIKey(http.HandlerFunc(s.history)))
 	mux.Handle("POST /admin/api-keys", s.withAdmin(http.HandlerFunc(s.createAPIKey)))
 	mux.Handle("GET /admin/api-keys", s.withAdmin(http.HandlerFunc(s.listAPIKeys)))
@@ -127,7 +127,10 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	// Synchronous waiting is a convenience path. Keep the polling interval
+	// deliberately coarse; workers operate on second-scale browser/network work,
+	// so 100 ms database polling only creates read amplification.
+	ticker := time.NewTicker(500 * time.Millisecond)
 	deadline := time.NewTimer(time.Duration(waitMS) * time.Millisecond)
 	defer ticker.Stop()
 	defer deadline.Stop()
@@ -176,8 +179,17 @@ func writeTerminalJob(w http.ResponseWriter, job model.Job) bool {
 }
 
 func (s *Server) job(w http.ResponseWriter, r *http.Request) {
-	key := r.Context().Value(apiKeyContext).(store.APIKey)
-	job, err := s.store.GetJob(r.Context(), r.PathValue("id"), key.ID)
+	raw := bearer(r.Header.Get("Authorization"))
+	if raw == "" {
+		writeError(w, http.StatusUnauthorized, "missing bearer API key")
+		return
+	}
+
+	// Status polling performs no new scrape work. Authorize and fetch the job
+	// in one read-only query instead of running the general middleware, which
+	// would consume the expensive-work rate bucket and update last_used_at on
+	// every poll.
+	job, err := s.store.GetJobByAPIKey(r.Context(), r.PathValue("id"), raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "job not found")
 		return
@@ -186,6 +198,7 @@ func (s *Server) job(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read job")
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, job)
 }
 
