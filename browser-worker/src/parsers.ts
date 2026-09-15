@@ -1,6 +1,8 @@
 import * as cheerio from "cheerio";
 import type { Listing } from "./types.js";
 
+const canonicalQueryParams = new Set(["th", "sku_id"]);
+
 function compact(text: string | undefined | null): string {
   return (text ?? "").replace(/\s+/g, " ").trim();
 }
@@ -52,7 +54,7 @@ function canonical(base: string, href: string): string {
     const url = new URL(href, base);
     url.hash = "";
     for (const key of [...url.searchParams.keys()]) {
-      if (!new Set(["th", "sku_id"]).has(key)) url.searchParams.delete(key);
+      if (!canonicalQueryParams.has(key)) url.searchParams.delete(key);
     }
     return url.toString();
   } catch {
@@ -221,6 +223,17 @@ function aliInitDataRoot(html: string): unknown {
   return extractJSONObject(html, jsonStart, 2_000_000);
 }
 
+function arrayValue(value: unknown): unknown[] | undefined {
+  return Array.isArray(value) ? value : undefined;
+}
+
+function fastAliItemList(root: unknown): unknown[] | undefined {
+  return arrayValue(dig(root, "mods", "itemList", "content"))
+    ?? arrayValue(dig(root, "data", "mods", "itemList", "content"))
+    ?? arrayValue(dig(root, "root", "fields", "mods", "itemList", "content"))
+    ?? arrayValue(dig(root, "data", "root", "fields", "mods", "itemList", "content"));
+}
+
 function findAliItemList(value: unknown, depth = 0): unknown[] | undefined {
   if (depth > 10 || value === null || typeof value !== "object") return undefined;
   if (Array.isArray(value)) {
@@ -245,7 +258,7 @@ function findAliItemList(value: unknown, depth = 0): unknown[] | undefined {
 }
 
 function aliStructuredListings(root: unknown, limit: number): Listing[] {
-  const items = findAliItemList(root);
+  const items = fastAliItemList(root) ?? findAliItemList(root);
   if (!items) return [];
 
   const out: Listing[] = [];
@@ -362,9 +375,14 @@ function aliDOM(html: string, limit: number): Listing[] {
 
 export function parseAliExpress(html: string, limit: number): Listing[] {
   const initData = aliStructuredListings(aliInitDataRoot(html), limit);
+  if (initData.length >= limit) return dedupe(initData, limit);
+
   const runParams = aliStructuredListings(aliRunParamsRoot(html), limit);
+  const structured = dedupe([...initData, ...runParams], limit);
+  if (structured.length >= limit) return structured;
+
   const dom = aliDOM(html, limit);
-  return dedupe([...initData, ...runParams, ...dom], limit);
+  return dedupe([...structured, ...dom], limit);
 }
 
 export function parseEbay(html: string, limit: number): Listing[] {
