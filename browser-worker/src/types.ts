@@ -25,9 +25,9 @@ export interface Listing {
 }
 
 export interface ScrapeTimings {
-  direct_fetch_ms?: number;
+  direct_path_ms?: number;
   direct_parse_ms?: number;
-  browser_fetch_ms?: number;
+  browser_path_ms?: number;
   browser_parse_ms?: number;
 }
 
