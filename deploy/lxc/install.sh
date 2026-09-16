@@ -107,9 +107,9 @@ if [[ ! -f .bootstrap-client-created ]]; then
   echo "$CLIENT_KEY"
   echo
   echo "For ebay-search-mcp after your Cloudflare hostname is configured:"
-  echo "AMAZON_SELFHOSTED_URL=https://YOUR_HOSTNAME/v1/search"
-  echo "ALIEXPRESS_SELFHOSTED_URL=https://YOUR_HOSTNAME/v1/search"
-  echo "SELFHOSTED_API_KEY=${CLIENT_KEY}"
+  echo "SELFHOSTED_SCRAPER_URL=https://YOUR_HOSTNAME"
+  echo "SELFHOSTED_SCRAPER_API_KEY=${CLIENT_KEY}"
+  echo "This single URL/key pair enables Amazon, AliExpress, and eBay self-hosted fallbacks."
 fi
 
 echo

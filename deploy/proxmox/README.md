@@ -61,10 +61,11 @@ The installer prints the first `ws_live_...` API key. Save it. Then configure th
 Once the hostname is live, the matching MCP configuration is:
 
 ```env
-AMAZON_SELFHOSTED_URL=https://YOUR_HOSTNAME/v1/search
-ALIEXPRESS_SELFHOSTED_URL=https://YOUR_HOSTNAME/v1/search
-SELFHOSTED_API_KEY=ws_live_...
+SELFHOSTED_SCRAPER_URL=https://YOUR_HOSTNAME
+SELFHOSTED_SCRAPER_API_KEY=ws_live_...
 ```
+
+That one authenticated scraper endpoint serves the Amazon, AliExpress, and eBay self-hosted fallback routes. Marketplace-specific `*_SELFHOSTED_URL` and `*_SELFHOSTED_API_KEY` variables remain available in `ebay-search-mcp` only when separate scraper deployments are intentionally needed.
 
 Run the live extraction validation inside the CT:
 

@@ -208,187 +208,216 @@ func (s *Store) ClaimJob(ctx context.Context, workerID string) (model.Job, error
 	return job, nil
 }
 
-func (s *Store) RenewJobClaim(ctx context.Context, jobID, workerID string) error {
-	tag, err := s.pool.Exec(ctx, `
+// RefreshJobClaim renews a running job's lease. If another worker has already
+// reclaimed the job (or the job is no longer running), the caller must stop
+// processing it and discard any in-flight scrape result.
+func (s *Store) RefreshJobClaim(ctx context.Context, id, workerID string) error {
+	result, err := s.pool.Exec(ctx, `
 		UPDATE scrape_jobs
 		SET claimed_at=now()
 		WHERE id=$1::uuid AND status='running' AND worker_id=$2`,
-		jobID, workerID,
+		id, workerID,
 	)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() != 1 {
+	if result.RowsAffected() != 1 {
 		return ErrJobClaimLost
 	}
 	return nil
 }
 
-func (s *Store) CompleteJob(ctx context.Context, jobID, workerID string, listings []model.Listing) error {
-	payload, err := json.Marshal(listings)
-	if err != nil {
-		return err
+func (s *Store) CompleteJob(ctx context.Context, job model.Job, listings []model.Listing) error {
+	if job.WorkerID == "" {
+		return fmt.Errorf("complete job %s: missing worker claim", job.ID)
 	}
-	tx, err := s.pool.Begin(ctx)
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	var requester string
-	if err := tx.QueryRow(ctx, `
-		UPDATE scrape_jobs
-		SET status='complete',result=$3,finished_at=now()
+
+	// Lock and verify the claim before writing product/observation data. This
+	// prevents a stale worker from committing results after the job was requeued
+	// and claimed by a different worker.
+	var owned int
+	err = tx.QueryRow(ctx, `
+		SELECT 1
+		FROM scrape_jobs
 		WHERE id=$1::uuid AND status='running' AND worker_id=$2
-		RETURNING requested_by::text`, jobID, workerID, payload).Scan(&requester); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrJobClaimLost
-		}
+		FOR UPDATE`,
+		job.ID, job.WorkerID,
+	).Scan(&owned)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrJobClaimLost
+	}
+	if err != nil {
 		return err
 	}
-	for _, listing := range listings {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO listings (marketplace,external_id,title,url,image_url,seller,rating,review_count,sold_count,price_minor,shipping_minor,currency,available,sponsored,raw,observed_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now())
+
+	for _, item := range listings {
+		if item.ExternalID == "" || item.URL == "" || item.Title == "" {
+			continue
+		}
+		var productID int64
+		err = tx.QueryRow(ctx, `
+			INSERT INTO products (marketplace,external_id,canonical_url,title,image_url,seller)
+			VALUES ($1,$2,$3,$4,NULLIF($5,''),NULLIF($6,''))
 			ON CONFLICT (marketplace,external_id) DO UPDATE SET
-				title=EXCLUDED.title,url=EXCLUDED.url,image_url=EXCLUDED.image_url,seller=EXCLUDED.seller,rating=EXCLUDED.rating,
-				review_count=EXCLUDED.review_count,sold_count=EXCLUDED.sold_count,price_minor=EXCLUDED.price_minor,
-				shipping_minor=EXCLUDED.shipping_minor,currency=EXCLUDED.currency,available=EXCLUDED.available,sponsored=EXCLUDED.sponsored,
-				raw=EXCLUDED.raw,observed_at=now()`,
-			listing.Marketplace, listing.ExternalID, listing.Title, listing.URL, listing.ImageURL, listing.Seller,
-			listing.Rating, listing.ReviewCount, listing.SoldCount, listing.PriceMinor, listing.ShippingMinor,
-			listing.Currency, listing.Available, listing.Sponsored, listing.Raw,
+				canonical_url=EXCLUDED.canonical_url,
+				title=EXCLUDED.title,
+				image_url=COALESCE(EXCLUDED.image_url,products.image_url),
+				seller=COALESCE(EXCLUDED.seller,products.seller),
+				updated_at=now()
+			RETURNING id`,
+			item.Marketplace, item.ExternalID, item.URL, item.Title, item.ImageURL, item.Seller,
+		).Scan(&productID)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO observations (product_id,job_id,price_minor,original_price_minor,shipping_minor,currency,available,rating,review_count,sold_count,sponsored,source)
+			SELECT $1,$2::uuid,$3,$4,$5,NULLIF($6,''),$7,$8,$9,$10,$11,$12
+			WHERE NOT EXISTS (
+				SELECT 1
+				FROM observations o
+				WHERE o.id=(SELECT id FROM observations WHERE product_id=$1 ORDER BY observed_at DESC LIMIT 1)
+					AND o.price_minor IS NOT DISTINCT FROM $3
+					AND o.original_price_minor IS NOT DISTINCT FROM $4
+					AND o.shipping_minor IS NOT DISTINCT FROM $5
+					AND o.currency IS NOT DISTINCT FROM NULLIF($6,'')
+					AND o.available IS NOT DISTINCT FROM $7
+					AND o.rating IS NOT DISTINCT FROM $8
+					AND o.review_count IS NOT DISTINCT FROM $9
+					AND o.sold_count IS NOT DISTINCT FROM $10
+					AND o.sponsored IS NOT DISTINCT FROM $11
+					AND o.observed_at > now()-interval '24 hours'
+			)`,
+			productID, job.ID, item.PriceMinor, item.OriginalPriceMinor, item.ShipMinor, item.Currency,
+			item.Available, item.Rating, item.ReviewCount, item.SoldCount, item.Sponsored, item.Marketplace,
 		)
 		if err != nil {
 			return err
 		}
-		if listing.PriceMinor != nil {
-			_, err = tx.Exec(ctx, `
-				INSERT INTO price_history (marketplace,external_id,price_minor,shipping_minor,currency,observed_at)
-				VALUES ($1,$2,$3,$4,$5,now())`,
-				listing.Marketplace, listing.ExternalID, listing.PriceMinor, listing.ShippingMinor, listing.Currency,
-			)
-			if err != nil {
-				return err
-			}
-		}
 	}
-	return tx.Commit(ctx)
-}
 
-func (s *Store) FailJob(ctx context.Context, jobID, workerID, message string) error {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE scrape_jobs SET status='failed',error=$3,finished_at=now()
-		WHERE id=$1::uuid AND status='running' AND worker_id=$2`,
-		jobID, workerID, message,
+	payload, err := json.Marshal(listings)
+	if err != nil {
+		return err
+	}
+	result, err := tx.Exec(ctx, `
+		UPDATE scrape_jobs
+		SET status='complete',result=$2::jsonb,finished_at=now(),error=NULL
+		WHERE id=$1::uuid AND status='running' AND worker_id=$3`,
+		job.ID, string(payload), job.WorkerID,
 	)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() != 1 {
+	if result.RowsAffected() != 1 {
+		return ErrJobClaimLost
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) FailJob(ctx context.Context, id, workerID, message string) error {
+	result, err := s.pool.Exec(ctx, `
+		UPDATE scrape_jobs
+		SET status='failed',error=$3,finished_at=now()
+		WHERE id=$1::uuid AND status='running' AND worker_id=$2`,
+		id, workerID, message,
+	)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
 		return ErrJobClaimLost
 	}
 	return nil
 }
 
 func (s *Store) RequeueStaleJobs(ctx context.Context, olderThan time.Duration) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `
+	result, err := s.pool.Exec(ctx, `
 		UPDATE scrape_jobs
-		SET status='queued',worker_id=NULL,claimed_at=NULL,error='requeued after stale worker claim'
-		WHERE status='running' AND claimed_at < now() - $1::interval`,
-		intervalString(olderThan),
+		SET status='queued',claimed_at=NULL,worker_id=NULL,error='requeued after stale worker claim'
+		WHERE status='running' AND claimed_at < now()-($1 * interval '1 second')`,
+		olderThan.Seconds(),
 	)
 	if err != nil {
 		return 0, err
 	}
-	return tag.RowsAffected(), nil
+	return result.RowsAffected(), nil
 }
 
-func (s *Store) UpsertWorker(ctx context.Context, workerID, hostname string, maxConcurrency, inFlight int, metadata map[string]any) error {
-	payload, err := json.Marshal(metadata)
-	if err != nil {
-		return err
-	}
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO workers (id,hostname,max_concurrency,in_flight,last_seen_at,metadata)
-		VALUES ($1,$2,$3,$4,now(),$5)
-		ON CONFLICT (id) DO UPDATE SET
-			hostname=EXCLUDED.hostname,max_concurrency=EXCLUDED.max_concurrency,in_flight=EXCLUDED.in_flight,last_seen_at=now(),metadata=EXCLUDED.metadata`,
-		workerID, hostname, maxConcurrency, inFlight, payload,
+func (s *Store) TouchWorker(ctx context.Context, id string, capabilities []string) error {
+	payload, _ := json.Marshal(capabilities)
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO workers (id,last_seen,capabilities)
+		VALUES ($1,now(),$2::jsonb)
+		ON CONFLICT (id) DO UPDATE SET last_seen=now(),capabilities=EXCLUDED.capabilities`,
+		id, string(payload),
 	)
 	return err
 }
 
 func (s *Store) ListWorkers(ctx context.Context) ([]model.Worker, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id,hostname,max_concurrency,in_flight,last_seen_at,metadata
-		FROM workers
-		ORDER BY last_seen_at DESC`)
+	rows, err := s.pool.Query(ctx, `SELECT id,last_seen,capabilities FROM workers ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var workers []model.Worker
+
+	workers := []model.Worker{}
 	for rows.Next() {
 		var worker model.Worker
-		var payload []byte
-		if err := rows.Scan(&worker.ID, &worker.Hostname, &worker.MaxConcurrency, &worker.InFlight, &worker.LastSeenAt, &payload); err != nil {
+		var raw []byte
+		if err := rows.Scan(&worker.ID, &worker.LastSeen, &raw); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(payload, &worker.Metadata)
+		_ = json.Unmarshal(raw, &worker.Capabilities)
 		workers = append(workers, worker)
 	}
 	return workers, rows.Err()
 }
 
 func (s *Store) History(ctx context.Context, marketplace, externalID string, days int) ([]model.PricePoint, error) {
+	if days < 1 {
+		days = 60
+	}
+	if days > 365 {
+		days = 365
+	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT price_minor,shipping_minor,currency,observed_at
-		FROM price_history
-		WHERE marketplace=$1 AND external_id=$2 AND observed_at >= now() - ($3 || ' days')::interval
-		ORDER BY observed_at`, marketplace, externalID, days)
+		SELECT o.observed_at,o.price_minor,o.original_price_minor,o.shipping_minor,COALESCE(o.currency,''),o.available,o.rating,o.review_count,o.sold_count,o.sponsored,o.source
+		FROM observations o
+		JOIN products p ON p.id=o.product_id
+		WHERE p.marketplace=$1 AND p.external_id=$2
+			AND o.observed_at >= now()-($3::text || ' days')::interval
+		ORDER BY o.observed_at`,
+		marketplace, externalID, days,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var points []model.PricePoint
+
+	points := []model.PricePoint{}
 	for rows.Next() {
-		var p model.PricePoint
-		if err := rows.Scan(&p.PriceMinor, &p.ShippingMinor, &p.Currency, &p.ObservedAt); err != nil {
+		var point model.PricePoint
+		if err := rows.Scan(&point.ObservedAt, &point.PriceMinor, &point.OriginalPriceMinor, &point.ShipMinor, &point.Currency, &point.Available, &point.Rating, &point.ReviewCount, &point.SoldCount, &point.Sponsored, &point.Source); err != nil {
 			return nil, err
 		}
-		points = append(points, p)
+		points = append(points, point)
 	}
 	return points, rows.Err()
 }
 
-func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id::text,name,key_prefix,rate_limit_per_minute
-		FROM api_keys
-		WHERE revoked_at IS NULL
-		ORDER BY created_at DESC`)
+func (s *Store) PruneHistory(ctx context.Context, days int) (int64, error) {
+	result, err := s.pool.Exec(ctx, `DELETE FROM observations WHERE observed_at < now()-($1::text || ' days')::interval`, fmt.Sprint(days))
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	defer rows.Close()
-	var keys []APIKey
-	for rows.Next() {
-		var key APIKey
-		if err := rows.Scan(&key.ID, &key.Name, &key.Prefix, &key.RateLimitPerMinute); err != nil {
-			return nil, err
-		}
-		keys = append(keys, key)
-	}
-	return keys, rows.Err()
-}
-
-func (s *Store) RevokeAPIKey(ctx context.Context, id string) error {
-	return s.pool.QueryRow(ctx, `
-		UPDATE api_keys SET revoked_at=now()
-		WHERE id=$1::uuid AND revoked_at IS NULL
-		RETURNING id`, id).Scan(&id)
-}
-
-func intervalString(d time.Duration) string {
-	return fmt.Sprintf("%f seconds", d.Seconds())
+	return result.RowsAffected(), nil
 }
