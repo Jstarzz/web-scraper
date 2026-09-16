@@ -13,6 +13,9 @@ const blockImages = !/^(0|false|no)$/i.test(process.env.BROWSER_BLOCK_IMAGES ?? 
 const maxHTMLBytes = Math.max(1 << 20, Number(process.env.MAX_HTML_BYTES ?? 8 << 20));
 const userAgent = process.env.SCRAPER_USER_AGENT || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36";
 const requestJitterMs = Math.max(0, Number(process.env.REQUEST_JITTER_MS ?? 100));
+const aliHydrateSettleMs = Math.max(50, Number(process.env.ALIEXPRESS_HYDRATE_SETTLE_MS ?? 200));
+const aliScrollSettleMs = Math.max(100, Number(process.env.ALIEXPRESS_SCROLL_SETTLE_MS ?? 350));
+const aliMaxScrolls = Math.max(0, Math.min(8, Number(process.env.ALIEXPRESS_MAX_SCROLLS ?? 3)));
 const marketplaceMinIntervalMs: Record<Marketplace, number> = {
   amazon: Math.max(0, Number(process.env.AMAZON_MIN_INTERVAL_MS ?? 350)),
   aliexpress: Math.max(0, Number(process.env.ALIEXPRESS_MIN_INTERVAL_MS ?? 300)),
@@ -156,7 +159,19 @@ async function directHTML(marketplace: Marketplace, query: string, signal?: Abor
   }
 }
 
-async function waitForMarketplace(page: Page, marketplace: Marketplace): Promise<void> {
+async function aliExpressProductCount(page: Page): Promise<number> {
+  return page.locator('a[href*="/item/"]').evaluateAll((links) => {
+    const ids = new Set<string>();
+    for (const link of links) {
+      const href = link.getAttribute("href") ?? "";
+      const match = href.match(/\/item\/(\d+)\.html/i);
+      if (match) ids.add(match[1]);
+    }
+    return ids.size;
+  });
+}
+
+async function waitForMarketplace(page: Page, marketplace: Marketplace, limit: number): Promise<void> {
   const selector = marketplace === "amazon"
     ? '[data-component-type="s-search-result"], div[data-asin]:not([data-asin=""])'
     : marketplace === "aliexpress"
@@ -165,16 +180,19 @@ async function waitForMarketplace(page: Page, marketplace: Marketplace): Promise
 
   await page.locator(selector).first().waitFor({ state: "attached", timeout: Math.min(navTimeout, 8_000) }).catch(() => undefined);
 
-  if (marketplace === "aliexpress") {
-    await page.waitForTimeout(800);
-    for (let i = 0; i < 3; i++) {
-      await page.evaluate(() => window.scrollBy(0, Math.max(900, window.innerHeight)));
-      await page.waitForTimeout(900);
-    }
+  if (marketplace !== "aliexpress") return;
+
+  await page.waitForTimeout(aliHydrateSettleMs);
+  if (await aliExpressProductCount(page) >= limit) return;
+
+  for (let i = 0; i < aliMaxScrolls; i++) {
+    await page.evaluate(() => window.scrollBy(0, Math.max(900, window.innerHeight)));
+    await page.waitForTimeout(aliScrollSettleMs);
+    if (await aliExpressProductCount(page) >= limit) return;
   }
 }
 
-async function browserHTML(marketplace: Marketplace, query: string, signal?: AbortSignal): Promise<string> {
+async function browserHTML(marketplace: Marketplace, query: string, limit: number, signal?: AbortSignal): Promise<string> {
   await pace(marketplace);
   await marketplacePools[marketplace].acquire(signal);
   let browserPermit = false;
@@ -203,7 +221,7 @@ async function browserHTML(marketplace: Marketplace, query: string, signal?: Abo
 
       const response = await page.goto(searchURL(marketplace, query), { waitUntil: "domcontentloaded", timeout: navTimeout });
       if (response && response.status() >= 400) throw new Error(`browser navigation status ${response.status()}`);
-      await waitForMarketplace(page, marketplace);
+      await waitForMarketplace(page, marketplace, limit);
       const html = await page.content();
       if (Buffer.byteLength(html, "utf8") > maxHTMLBytes) throw new Error(`browser HTML exceeded ${maxHTMLBytes} bytes`);
       if (looksChallenged(html)) throw new Error("browser received a challenge page");
@@ -226,22 +244,40 @@ async function scrape(input: ScrapeRequest, signal?: AbortSignal): Promise<Scrap
   const started = Date.now();
   const limit = input.limit ?? 20;
   const marketplace = input.marketplace;
+  const timings: NonNullable<ScrapeResult["timings"]> = {};
   let direct: Listing[] = [];
   let directError: string | undefined;
 
-  if (httpFastPath && (marketplace === "amazon" || marketplace === "aliexpress")) {
+  if (httpFastPath) {
+    const directStarted = Date.now();
     try {
-      direct = parse(marketplace, await directHTML(marketplace, input.query, signal), limit);
+      const directDocument = await directHTML(marketplace, input.query, signal);
+      timings.direct_path_ms = Date.now() - directStarted;
+      const parseStarted = Date.now();
+      direct = parse(marketplace, directDocument, limit);
+      timings.direct_parse_ms = Date.now() - parseStarted;
       if (enough(direct, limit)) {
-        return { listings: direct, strategy: "http", direct_count: direct.length, duration_ms: Date.now() - started };
+        return {
+          listings: direct,
+          strategy: "http",
+          direct_count: direct.length,
+          duration_ms: Date.now() - started,
+          timings,
+        };
       }
     } catch (error) {
+      timings.direct_path_ms ??= Date.now() - directStarted;
       if (signal?.aborted) throw error;
       directError = error instanceof Error ? error.message : String(error);
     }
   }
 
-  const browserListings = parse(marketplace, await browserHTML(marketplace, input.query, signal), limit);
+  const browserStarted = Date.now();
+  const browserDocument = await browserHTML(marketplace, input.query, limit, signal);
+  timings.browser_path_ms = Date.now() - browserStarted;
+  const browserParseStarted = Date.now();
+  const browserListings = parse(marketplace, browserDocument, limit);
+  timings.browser_parse_ms = Date.now() - browserParseStarted;
   const listings = mergeListings(browserListings, direct, limit);
   if (!listings.length) throw new Error(`no listings extracted${directError ? `; fast path: ${directError}` : ""}`);
   return {
@@ -249,6 +285,7 @@ async function scrape(input: ScrapeRequest, signal?: AbortSignal): Promise<Scrap
     strategy: direct.length ? "hybrid" : "browser",
     direct_count: direct.length,
     duration_ms: Date.now() - started,
+    timings,
   };
 }
 
@@ -297,6 +334,9 @@ const server = http.createServer(async (req, res) => {
       max_html_bytes: maxHTMLBytes,
       request_jitter_ms: requestJitterMs,
       marketplace_min_interval_ms: marketplaceMinIntervalMs,
+      aliexpress_hydrate_settle_ms: aliHydrateSettleMs,
+      aliexpress_scroll_settle_ms: aliScrollSettleMs,
+      aliexpress_max_scrolls: aliMaxScrolls,
       telemetry: telemetry.snapshot(),
     });
     return;
@@ -339,6 +379,7 @@ const server = http.createServer(async (req, res) => {
       listings: result.listings.length,
       direct_count: result.direct_count,
       duration_ms: result.duration_ms,
+      timings: result.timings,
     }));
     json(res, 200, result);
   } catch (error) {

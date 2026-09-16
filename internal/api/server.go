@@ -116,6 +116,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	compact := wantsCompact(r)
 	key := r.Context().Value(apiKeyContext).(store.APIKey)
 	job, err := s.store.CreateJob(r.Context(), req, key.ID)
 	if err != nil {
@@ -123,7 +124,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if waitMS == 0 {
-		writeJSON(w, http.StatusAccepted, job)
+		writeJobJSON(w, http.StatusAccepted, job, compact)
 		return
 	}
 
@@ -145,7 +146,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusInternalServerError, "could not read queued job")
 				return
 			}
-			if writeTerminalJob(w, current) {
+			if writeTerminalJob(w, current, compact) {
 				return
 			}
 		case <-deadline.C:
@@ -153,22 +154,22 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				current = job
 			}
-			if writeTerminalJob(w, current) {
+			if writeTerminalJob(w, current, compact) {
 				return
 			}
-			writeJSON(w, http.StatusAccepted, current)
+			writeJobJSON(w, http.StatusAccepted, current, compact)
 			return
 		}
 	}
 }
 
-func writeTerminalJob(w http.ResponseWriter, job model.Job) bool {
+func writeTerminalJob(w http.ResponseWriter, job model.Job, compact bool) bool {
 	switch job.Status {
 	case "complete":
-		writeJSON(w, http.StatusOK, job)
+		writeJobJSON(w, http.StatusOK, job, compact)
 		return true
 	case "failed":
-		writeJSON(w, http.StatusBadGateway, job)
+		writeJobJSON(w, http.StatusBadGateway, job, compact)
 		return true
 	default:
 		return false
@@ -186,7 +187,7 @@ func (s *Server) job(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read job")
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	writeJobJSON(w, http.StatusOK, job, wantsCompact(r))
 }
 
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {
