@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseAliExpress, parseAmazon } from "./parsers.js";
+import { parseAliExpress, parseAmazon, parseEbay } from "./parsers.js";
 
 test("parses Amazon search result cards and deal metadata", () => {
   const html = `
@@ -104,6 +104,36 @@ test("parses current AliExpress _init_data_ hydration with nested root fields", 
   assert.equal(item.url, "https://www.aliexpress.com/item/1005007777777777.html");
 });
 
+test("uses DOM only to fill a partial structured AliExpress result set", () => {
+  const initData = {
+    data: {
+      root: {
+        fields: {
+          mods: {
+            itemList: {
+              content: [{
+                productId: "1005001111111111",
+                title: { displayTitle: "Structured ESP32 Board" },
+                prices: { salePrice: { minPrice: 10, currencyCode: "USD" } }
+              }]
+            }
+          }
+        }
+      }
+    }
+  };
+  const html = `
+    <!-- init-data-start --><script>window._dida_config_={data:${JSON.stringify(initData)}};</script><!-- init-data-end -->
+    <div class="search-card-item">
+      <a href="https://www.aliexpress.com/item/1005002222222222.html" title="DOM ESP32 Board"></a>
+      <div class="price-area">US $12.00</div>
+    </div>`;
+  const items = parseAliExpress(html, 2);
+  assert.equal(items.length, 2);
+  assert.equal(items[0].external_id, "1005001111111111");
+  assert.equal(items[1].external_id, "1005002222222222");
+});
+
 test("parses and deduplicates AliExpress DOM cards", () => {
   const html = `
   <div class="search-card-item">
@@ -131,4 +161,26 @@ test("parses and deduplicates AliExpress DOM cards", () => {
   assert.equal(items[0].review_count, 321);
   assert.equal(items[0].sold_count, 1_500);
   assert.equal(items[0].seller, "Example Store");
+});
+
+test("parses eBay search HTML for the HTTP fast path", () => {
+  const html = `
+  <ul>
+    <li class="s-item">
+      <a class="s-item__link" href="https://www.ebay.com/itm/ESP32-Board/335702860722?hash=abc">
+        <span class="s-item__title">ESP32-S3 Development Board</span>
+      </a>
+      <span class="s-item__price">US $35.00</span>
+      <span class="s-item__shipping">Free shipping</span>
+      <span class="s-item__seller-info-text">example-seller</span>
+      <img src="https://i.ebayimg.com/example.jpg" />
+    </li>
+  </ul>`;
+  const [item] = parseEbay(html, 10);
+  assert.equal(item.external_id, "335702860722");
+  assert.equal(item.title, "ESP32-S3 Development Board");
+  assert.equal(item.price_minor, 3_500);
+  assert.equal(item.shipping_minor, 0);
+  assert.equal(item.currency, "USD");
+  assert.equal(item.seller, "example-seller");
 });

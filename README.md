@@ -33,7 +33,8 @@ Most extraction work is concentrated on Amazon and AliExpress:
 - browser fallback blocks image/font/media transfers by default while keeping image URLs available in markup;
 - Amazon uses the current `data-component-type="s-search-result"` structure plus a `data-asin` fallback;
 - Amazon returns current/list prices, rating/review data and a sponsored-result flag when present;
-- AliExpress prefers the structured `window.runParams -> mods.itemList.content` payload when present, then falls back to hydrated DOM cards;
+- AliExpress prefers structured hydration data when present, then falls back to hydrated DOM cards;
+- AliExpress browser fallback stops scrolling as soon as the requested number of unique products is present;
 - AliExpress returns sale/original prices, seller, rating/review count and sold count when present;
 - known challenge/verification pages are detected and treated as failures rather than being stored as product data;
 - structured and DOM results are deduplicated by marketplace product ID.
@@ -93,10 +94,19 @@ curl -X POST https://scrape.example.com/v1/search \
   -d '{"marketplace":"aliexpress","query":"esp32 display","limit":20,"wait_ms":12000}'
 ```
 
-If the job is still running the API returns HTTP 202 with the job ID. Poll it with:
+AI/MCP callers can request the compact view by adding `?compact=1`. It keeps product IDs, titles, URLs, seller, price/shipping, availability, rating/review/sold counts and sponsored status, while dropping image URLs, repeated per-listing marketplace names, worker metadata and timestamps:
 
 ```bash
-curl https://scrape.example.com/v1/jobs/JOB_ID \
+curl -X POST 'https://scrape.example.com/v1/search?compact=1' \
+  -H "Authorization: Bearer $SCRAPER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"marketplace":"aliexpress","query":"esp32 display","limit":10,"wait_ms":12000}'
+```
+
+If the job is still running the API returns HTTP 202 with the job ID. Poll it with the same view when desired:
+
+```bash
+curl 'https://scrape.example.com/v1/jobs/JOB_ID?compact=1' \
   -H "Authorization: Bearer $SCRAPER_API_KEY"
 ```
 
