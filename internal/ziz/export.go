@@ -105,7 +105,7 @@ func ExportArticles(ctx context.Context, client *Client, cfg ExportConfig) (Expo
 			}
 
 			path := articlePartPath(articlesDir, page)
-			if cfg.Resume {
+			if cfg.Resume && page != totalPages {
 				if _, err := os.Stat(path); err == nil {
 					pagesSkipped.Add(1)
 					continue
