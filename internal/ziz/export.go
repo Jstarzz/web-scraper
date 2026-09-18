@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -168,7 +169,7 @@ func articlePartPath(dir string, page int) string {
 	return filepath.Join(dir, fmt.Sprintf("part-%05d.jsonl.gz", page))
 }
 
-func writeArticlePart(path string, baseURL interface{ String() string }, posts []wpPost) error {
+func writeArticlePart(path string, baseURL *url.URL, posts []wpPost) error {
 	tmp := path + ".tmp"
 	file, err := os.Create(tmp)
 	if err != nil {
@@ -190,12 +191,8 @@ func writeArticlePart(path string, baseURL interface{ String() string }, posts [
 	encoder := json.NewEncoder(buffer)
 	scrapedAt := time.Now()
 
-	base, err := parseBaseURL(baseURL.String())
-	if err != nil {
-		return err
-	}
 	for _, post := range posts {
-		article := articleFromWP(base, post, scrapedAt)
+		article := articleFromWP(baseURL, post, scrapedAt)
 		if err := encoder.Encode(article); err != nil {
 			return err
 		}
@@ -217,10 +214,6 @@ func writeArticlePart(path string, baseURL interface{ String() string }, posts [
 	}
 	ok = true
 	return nil
-}
-
-func parseBaseURL(raw string) (*url.URL, error) {
-	return url.Parse(raw)
 }
 
 func ReadArticles(outputDir string, fn func(Article) error) error {
@@ -270,12 +263,12 @@ func readArticlePart(path string, fn func(Article) error) error {
 }
 
 type ValidateStats struct {
-	UniqueArticles int      `json:"unique_articles"`
-	Duplicates     int      `json:"duplicate_articles"`
-	EmptyBodies    int      `json:"empty_bodies"`
-	EmptyTitles    int      `json:"empty_titles"`
-	MediaURLs      int      `json:"unique_media_urls"`
-	DuplicateIDs   []int    `json:"duplicate_ids,omitempty"`
+	UniqueArticles int   `json:"unique_articles"`
+	Duplicates     int   `json:"duplicate_articles"`
+	EmptyBodies    int   `json:"empty_bodies"`
+	EmptyTitles    int   `json:"empty_titles"`
+	MediaURLs      int   `json:"unique_media_urls"`
+	DuplicateIDs   []int `json:"duplicate_ids,omitempty"`
 }
 
 func ValidateArticles(outputDir string) (ValidateStats, error) {
