@@ -175,7 +175,7 @@ func (c *Client) FetchPostsPage(ctx context.Context, page, perPage int) ([]wpPos
 	q.Set("orderby", "id")
 	q.Set("order", "asc")
 	q.Set("_embed", "author,wp:featuredmedia,wp:term")
-	q.Set("_fields", "id,date,date_gmt,modified,modified_gmt,slug,link,title,content,excerpt,author,featured_media,categories,tags,_embedded")
+	q.Set("_fields", "id,date,date_gmt,modified,modified_gmt,slug,link,title,content,excerpt,author,featured_media,categories,tags,_links,_embedded")
 	parsed.RawQuery = q.Encode()
 
 	resp, err := c.do(ctx, http.MethodGet, parsed.String())
@@ -192,8 +192,13 @@ func (c *Client) FetchPostsPage(ctx context.Context, page, perPage int) ([]wpPos
 
 	total, _ := strconv.Atoi(resp.Header.Get("X-WP-Total"))
 	totalPages, _ := strconv.Atoi(resp.Header.Get("X-WP-TotalPages"))
-	if totalPages == 0 && len(posts) > 0 {
-		totalPages = page
+	if totalPages == 0 {
+		if len(posts) < perPage {
+			total = len(posts)
+			totalPages = 1
+		} else {
+			return nil, 0, 0, fmt.Errorf("posts page %d: WordPress pagination headers missing", page)
+		}
 	}
 	return posts, total, totalPages, nil
 }
