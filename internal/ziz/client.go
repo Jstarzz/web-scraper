@@ -87,7 +87,6 @@ func (c *Client) do(ctx context.Context, method, rawURL string) (*http.Response,
 		}
 		req.Header.Set("User-Agent", c.userAgent)
 		req.Header.Set("Accept", "application/json,text/html;q=0.9,*/*;q=0.8")
-		req.Header.Set("Accept-Encoding", "gzip")
 
 		resp, err := c.http.Do(req)
 		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
