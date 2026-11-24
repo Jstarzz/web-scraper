@@ -2,6 +2,7 @@ import http from "node:http";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { mergeListings, parseAliExpress, parseAmazon, parseEbay } from "./parsers.js";
 import { PermitPool, ScrapeTelemetry } from "./runtime.js";
+import { cookieHeader, regionCookies } from "./region.js";
 import type { Listing, Marketplace, ScrapeRequest, ScrapeResult } from "./types.js";
 
 const port = Number(process.env.BROWSER_PORT ?? 3000);
@@ -18,12 +19,12 @@ const aliScrollSettleMs = Math.max(100, Number(process.env.ALIEXPRESS_SCROLL_SET
 const aliMaxScrolls = Math.max(0, Math.min(8, Number(process.env.ALIEXPRESS_MAX_SCROLLS ?? 3)));
 const marketplaceMinIntervalMs: Record<Marketplace, number> = {
   amazon: Math.max(0, Number(process.env.AMAZON_MIN_INTERVAL_MS ?? 350)),
-  aliexpress: Math.max(0, Number(process.env.ALIEXPRESS_MIN_INTERVAL_MS ?? 300)),
+  aliexpress: Math.max(0, Number(process.env.ALIEXPRESS_MIN_INTERVAL_MS ?? 1500)),
   ebay: Math.max(0, Number(process.env.EBAY_MIN_INTERVAL_MS ?? 200)),
 };
 const marketplaceConcurrency: Record<Marketplace, number> = {
   amazon: Math.max(1, Number(process.env.AMAZON_MAX_CONCURRENT ?? 4)),
-  aliexpress: Math.max(1, Number(process.env.ALIEXPRESS_MAX_CONCURRENT ?? 2)),
+  aliexpress: Math.max(1, Number(process.env.ALIEXPRESS_MAX_CONCURRENT ?? 1)),
   ebay: Math.max(1, Number(process.env.EBAY_MAX_CONCURRENT ?? 3)),
 };
 
@@ -147,6 +148,7 @@ async function directHTML(marketplace: Marketplace, query: string, signal?: Abor
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "accept-language": "en-US,en;q=0.9",
         "cache-control": "no-cache",
+        ...(regionCookies[marketplace].length ? { "cookie": cookieHeader(marketplace) } : {}),
       },
     });
     if (!response.ok) throw new Error(`HTTP fast path status ${response.status}`);
@@ -204,10 +206,12 @@ async function browserHTML(marketplace: Marketplace, query: string, limit: numbe
 
     context = await browser.newContext({
       locale: "en-US",
+      timezoneId: "America/New_York",
       userAgent,
       viewport: { width: 1365, height: 900 },
       serviceWorkers: "block",
     });
+    await context.addCookies(regionCookies[marketplace].map((c) => ({ ...c, path: "/" })));
     const onAbort = () => void context?.close().catch(() => undefined);
     signal?.addEventListener("abort", onAbort, { once: true });
 
